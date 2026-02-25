@@ -1,0 +1,10 @@
+aws_region     = "us-east-1"
+environment    = "production"
+domain_name    = "api.yourdomain.com"
+
+ebay_environment = "production"
+
+ebay_sandbox_client_id        = "YOUR_SANDBOX_CLIENT_ID"
+ebay_sandbox_client_secret    = "YOUR_SANDBOX_CLIENT_SECRET"
+ebay_production_client_id     = "YOUR_PRODUCTION_CLIENT_ID"
+ebay_production_client_secret = "YOUR_PRODUCTION_CLIENT_SECRET"
