@@ -1,0 +1,9 @@
+# Terraform
+aws-infrastructure/terraform/.terraform/
+aws-infrastructure/terraform/.terraform.lock.hcl
+aws-infrastructure/terraform/terraform.tfvars
+aws-infrastructure/terraform/*.tfstate
+aws-infrastructure/terraform/*.tfstate.backup
+aws-infrastructure/terraform/crash.log
+aws-infrastructure/terraform/override.tf
+aws-infrastructure/terraform/override.tf.json
