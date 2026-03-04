@@ -6,17 +6,22 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
   }
 
-  # Remote state storage — create this S3 bucket and DynamoDB table manually
-  # before running `terraform init`, or remove this block to use local state.
-  backend "s3" {
-    bucket         = "ebay-lister-terraform-state"   # change to your bucket name
-    key            = "backend/terraform.tfstate"
-    region         = "us-east-1"                     # change to your region
-    dynamodb_table = "ebay-lister-terraform-locks"   # change to your table name
-    encrypt        = true
-  }
+  # Remote state — uncomment when ready to deploy (S3 bucket must exist first).
+  # See README.md "One-Time Setup" for how to create the bucket.
+  #
+  # backend "s3" {
+  #   bucket       = "ebay-lister-terraform-state"
+  #   key          = "backend/terraform.tfstate"
+  #   region       = "us-east-1"
+  #   use_lockfile = true   # replaces deprecated dynamodb_table in Terraform 1.14+
+  #   encrypt      = true
+  # }
 }
 
 provider "aws" {

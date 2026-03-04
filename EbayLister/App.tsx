@@ -5,7 +5,7 @@ import { useListingDrafts } from './hooks/useListingDrafts';
 import { Header, ErrorMessage, LoadingIndicator, DraftList, Login } from './components';
 import { AuthService } from './services';
 
-const BACKEND_URL = 'http://localhost:3001';
+const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);

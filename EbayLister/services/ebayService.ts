@@ -22,7 +22,7 @@ class EbayService {
     // Backend proxy runs on localhost:3001 and handles CORS + authentication
     const isWeb = typeof window !== 'undefined' && !('ReactNative' in window);
     const baseURL = isWeb
-      ? 'http://localhost:3001/api/ebay'
+      ? 'https://api.ebay.who-is-tou.com/api/ebay'
       : this.config.environment === 'sandbox'
         ? 'https://api.sandbox.ebay.com'
         : 'https://api.ebay.com';
@@ -110,7 +110,7 @@ class EbayService {
    */
   private isUsingProxy(): boolean {
     const baseURL = this.axiosInstance.defaults.baseURL || '';
-    return baseURL.includes('localhost:3001');
+    return baseURL.includes('api.ebay.who-is-tou.com') || baseURL.includes('localhost:3001');
   }
 
   /**

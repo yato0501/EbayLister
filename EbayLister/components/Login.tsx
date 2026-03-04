@@ -6,7 +6,7 @@ interface LoginProps {
   onLoginSuccess: () => void;
 }
 
-const BACKEND_URL = 'http://localhost:3001';
+const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
 
 export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   const [loading, setLoading] = useState(false);

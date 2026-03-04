@@ -1,3 +1,9 @@
+# Claude Code local settings
+.claude/settings.local.json
+
+# Dependencies
+node_modules/
+
 # Terraform
 aws-infrastructure/terraform/.terraform/
 aws-infrastructure/terraform/.terraform.lock.hcl
@@ -5,5 +11,6 @@ aws-infrastructure/terraform/terraform.tfvars
 aws-infrastructure/terraform/*.tfstate
 aws-infrastructure/terraform/*.tfstate.backup
 aws-infrastructure/terraform/crash.log
+aws-infrastructure/terraform/lambda_placeholder.zip
 aws-infrastructure/terraform/override.tf
 aws-infrastructure/terraform/override.tf.json

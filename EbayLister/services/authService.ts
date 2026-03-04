@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { TokenStorage, StoredTokens } from './tokenStorage';
 
-const BACKEND_URL = 'http://localhost:3001';
+const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
 
 export class AuthService {
   /**
