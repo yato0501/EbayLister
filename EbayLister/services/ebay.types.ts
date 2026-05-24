@@ -46,11 +46,25 @@ export interface EbayInventoryItem {
   };
 }
 
+export interface EnhancementResult {
+  title: string;
+  brand: string;
+  manufacturerPartNumber: string;
+  interchangeablePartNumbers: string[];
+  supersedePartNumbers: string[];
+  condition: string;
+  placement: string;
+  years: string[];
+  makeModels: string[];
+  keywords: string[];
+}
+
 export interface EbayOffer {
   offerId: string;
   sku: string;
   marketplaceId: string;
   format: string;
+  title?: string;
   listingDescription?: string;
   listingPolicies?: {
     fulfillmentPolicyId?: string;
@@ -72,6 +86,12 @@ export interface EbayOffer {
     applyTax?: boolean;
     vatPercentage?: number;
   };
+  // Item-level fields populated from inventory_item
+  condition?: string;
+  conditionDescription?: string;
+  imageUrls?: string[];
+  aspects?: Record<string, string[]>;
+  quantity?: number;
 }
 
 export interface EbayOffersResponse {

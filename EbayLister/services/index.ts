@@ -13,5 +13,6 @@ export type {
   EbayOffersResponse,
   EbayInventoryItemsResponse,
   EbayError,
+  EnhancementResult,
 } from './ebay.types';
 export type { StoredTokens } from './tokenStorage';

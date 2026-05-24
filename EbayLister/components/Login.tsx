@@ -105,10 +105,16 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
     setError(null);
 
     try {
-      // Open eBay OAuth page
       const authUrl = `${BACKEND_URL}/auth/ebay`;
-      const canOpen = await Linking.canOpenURL(authUrl);
 
+      // On web, navigate in the same tab so the OAuth callback returns here
+      if (typeof window !== 'undefined') {
+        window.location.href = authUrl;
+        return;
+      }
+
+      // Native: open in external browser
+      const canOpen = await Linking.canOpenURL(authUrl);
       if (canOpen) {
         await Linking.openURL(authUrl);
       } else {

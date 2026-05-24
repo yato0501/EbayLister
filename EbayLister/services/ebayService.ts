@@ -197,13 +197,7 @@ class EbayService {
       await this.setAuthHeader();
 
       const response = await this.axiosInstance.get<EbayInventoryItemsResponse>(
-        '/sell/inventory/v1/inventory_item',
-        {
-          params: {
-            limit,
-            offset,
-          },
-        }
+        '/sell/inventory/v1/inventory_item'
       );
 
       return response.data;
@@ -239,38 +233,33 @@ class EbayService {
    * @param offset - Number of offers to skip
    * @returns Promise with unpublished offers
    */
-  async getListingDrafts(limit: number = 100, offset: number = 0): Promise<EbayOffer[]> {
+  async getListingDrafts(): Promise<EbayOffer[]> {
     try {
-      // eBay Sandbox has a bug with the offers endpoint - try inventory items instead
-      console.log('Fetching inventory items instead of offers due to Sandbox API issues...');
+      const isWeb = typeof window !== 'undefined' && !('ReactNative' in window);
+      const baseURL = isWeb ? 'https://api.ebay.who-is-tou.com' : '';
+      const response = await axios.get(`${baseURL}/api/listings`);
+      const { listings } = response.data;
 
-      const inventoryResponse = await this.getInventoryItems(limit, offset);
-
-      // For each inventory item, we'll create a mock offer object
-      // In a real scenario, we'd need to fetch the actual offers for each SKU
-      const drafts: EbayOffer[] = inventoryResponse.inventoryItems.map(item => ({
-        offerId: item.sku || 'unknown',
-        sku: item.sku || '',
-        marketplaceId: 'EBAY_US',
-        format: 'FIXED_PRICE' as const,
-        availableQuantity: item.availability?.shipToLocationAvailability?.quantity || 0,
-        categoryId: '',
-        listingDescription: item.product?.description || '',
-        listingPolicies: {
-          paymentPolicyId: '',
-          returnPolicyId: '',
-          fulfillmentPolicyId: '',
-        },
-        pricingSummary: {
-          price: {
-            value: '0.00',
-            currency: 'USD',
-          },
-        },
-        status: 'UNPUBLISHED' as const,
-      }));
-
-      return drafts;
+      return listings.map(({ sku, item, offers }: { sku: string; item: EbayInventoryItem | null; offers: EbayOffer[] }) => {
+        const offer = offers[0] || {};
+        return {
+          offerId:              offer.offerId            || sku,
+          sku,
+          title:                item?.product?.title     || '',
+          marketplaceId:        offer.marketplaceId      || 'EBAY_US',
+          format:               offer.format             || 'FIXED_PRICE',
+          listingDescription:   offer.listingDescription || item?.product?.description || '',
+          listingPolicies:      offer.listingPolicies    || {},
+          pricingSummary:       offer.pricingSummary     || { price: { value: '0.00', currency: 'USD' } },
+          categoryId:           offer.categoryId         || '',
+          status:               offer.status             || 'UNPUBLISHED',
+          condition:            item?.condition          || '',
+          conditionDescription: item?.conditionDescription || '',
+          imageUrls:            item?.product?.imageUrls || [],
+          aspects:              item?.product?.aspects   || {},
+          quantity:             item?.availability?.shipToLocationAvailability?.quantity ?? 0,
+        } as EbayOffer;
+      });
     } catch (error) {
       this.handleError(error);
       throw error;

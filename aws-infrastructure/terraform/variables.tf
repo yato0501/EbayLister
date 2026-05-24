@@ -21,6 +21,12 @@ variable "domain_name" {
   type        = string
 }
 
+variable "app_url" {
+  description = "URL of the frontend app that the OAuth callback redirects to (e.g. http://localhost:8081)"
+  type        = string
+  default     = "http://localhost:8081"
+}
+
 variable "ebay_environment" {
   description = "eBay environment: sandbox or production"
   type        = string
@@ -47,6 +53,12 @@ variable "ebay_production_client_id" {
 
 variable "ebay_production_client_secret" {
   description = "eBay Production Client Secret"
+  type        = string
+  sensitive   = true
+}
+
+variable "anthropic_api_key" {
+  description = "Anthropic API key for Claude AI listing enhancement"
   type        = string
   sensitive   = true
 }

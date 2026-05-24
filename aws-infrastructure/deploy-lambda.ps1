@@ -45,13 +45,17 @@ $serverPackageJson = @{
         "axios"               = "^1.13.2"
         "serverless-http"     = "^3.2.0"
         "@aws-sdk/client-dynamodb" = "^3.0.0"
+        "@anthropic-ai/sdk"        = "^0.98.0"
     }
 } | ConvertTo-Json -Depth 3
 
 $serverPackageJson | Out-File -FilePath (Join-Path $BuildDir "package.json") -Encoding utf8
 
 Push-Location $BuildDir
+$prevPref = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 & npm install --omit=dev 2>&1 | ForEach-Object { Write-Host "    $_" }
+$ErrorActionPreference = $prevPref
 Pop-Location
 
 # Zip using .NET (faster than Compress-Archive for large dirs)

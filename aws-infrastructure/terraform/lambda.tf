@@ -25,11 +25,12 @@ resource "aws_lambda_function" "backend" {
       EBAY_ENVIRONMENT              = var.ebay_environment
       DYNAMODB_TABLE_NAME           = aws_dynamodb_table.tokens.name
       REDIRECT_URI                  = "https://${var.domain_name}/auth/ebay/callback"
-      APP_URL                       = "https://${var.domain_name}"
+      APP_URL                       = var.app_url
       EBAY_SANDBOX_CLIENT_ID        = var.ebay_sandbox_client_id
       EBAY_SANDBOX_CLIENT_SECRET    = var.ebay_sandbox_client_secret
       EBAY_PRODUCTION_CLIENT_ID     = var.ebay_production_client_id
       EBAY_PRODUCTION_CLIENT_SECRET = var.ebay_production_client_secret
+      ANTHROPIC_API_KEY             = var.anthropic_api_key
     }
   }
 

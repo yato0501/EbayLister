@@ -1,5 +1,5 @@
 import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, View, Button, Text } from 'react-native';
+import { StyleSheet, View, Button, Text, TextInput } from 'react-native';
 import { useState, useEffect } from 'react';
 import { useListingDrafts } from './hooks/useListingDrafts';
 import { Header, ErrorMessage, LoadingIndicator, DraftList, Login } from './components';
@@ -11,6 +11,7 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
   const [creatingDraft, setCreatingDraft] = useState(false);
   const [createMessage, setCreateMessage] = useState<string | null>(null);
+  const [draftTitle, setDraftTitle] = useState('');
   const { drafts, loading, error, fetchListingDrafts } = useListingDrafts();
 
   // Check authentication on app startup
@@ -37,7 +38,8 @@ export default function App() {
     setCreateMessage(null);
 
     try {
-      const response = await fetch(`${BACKEND_URL}/test/create-sample-listing`);
+      const params = draftTitle.trim() ? `?title=${encodeURIComponent(draftTitle.trim())}` : '';
+      const response = await fetch(`${BACKEND_URL}/test/create-sample-listing${params}`);
 
       if (response.ok) {
         setCreateMessage('✅ Sample draft created successfully!');
@@ -83,6 +85,14 @@ export default function App() {
       <StatusBar style="auto" />
       <Header />
 
+      <TextInput
+        style={styles.titleInput}
+        placeholder="Draft title (e.g. 96-02 Toyota 4Runner ABS pump)"
+        placeholderTextColor="#aaa"
+        value={draftTitle}
+        onChangeText={setDraftTitle}
+      />
+
       <View style={styles.buttonContainer}>
         <View style={styles.button}>
           <Button
@@ -119,6 +129,17 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f5f5f5',
     padding: 20,
+  },
+  titleInput: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 14,
+    marginBottom: 10,
+    color: '#222',
   },
   buttonContainer: {
     flexDirection: 'row',
