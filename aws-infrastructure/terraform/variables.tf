@@ -62,3 +62,9 @@ variable "anthropic_api_key" {
   type        = string
   sensitive   = true
 }
+
+variable "ebay_ru_name" {
+  description = "eBay OAuth RuName (shown in Developer Portal under app OAuth settings). Used as redirect_uri in the OAuth flow."
+  type        = string
+  default     = ""
+}

@@ -1,6 +1,7 @@
 import { View, Text, Image, TextInput, TouchableOpacity, ActivityIndicator, StyleSheet, ScrollView, Platform } from 'react-native';
 import { useState } from 'react';
 import { EbayOffer, EnhancementResult } from '../services';
+import { DescTemplate, RateTable } from '../App';
 
 const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
 
@@ -18,6 +19,12 @@ const mpnVariants = (mpn: string): string[] => {
   return combined.length <= 65 ? [combined] : unique;
 };
 
+const RETURN_POLICY_OPTIONS = [
+  { value: 'BUYER_PAYS_30', label: '30 Day Returns - Customer Pays' },
+  { value: 'FREE_RETURNS',  label: 'Free Returns (30 Day)' },
+  { value: 'NO_RETURNS',    label: 'No Returns Accepted' },
+];
+
 const CONDITION_OPTIONS = [
   { value: 'NEW',                      label: 'New' },
   { value: 'USED_EXCELLENT',           label: 'Used - Excellent' },
@@ -30,6 +37,12 @@ const CONDITION_OPTIONS = [
 interface DraftCardProps {
   draft: EbayOffer;
   index: number;
+  onDelete?: (sku: string) => void;
+  allScheduledDates?: string[];
+  descTemplates?: DescTemplate[];
+  onTemplateAdded?: (t: DescTemplate) => void;
+  onTemplateDeleted?: (name: string) => void;
+  rateTables?: RateTable[];
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -83,6 +96,23 @@ const ConditionPicker = ({ value, onChange }: { value: string; onChange: (v: str
   return <EditField label="CONDITION" value={value} onChangeText={onChange} />;
 };
 
+const ReturnPolicyPicker = ({ value, onChange }: { value: string; onChange: (v: string) => void }) => {
+  if (Platform.OS === 'web') {
+    return (
+      <View style={styles.field}>
+        <Text style={styles.fieldLabel}>RETURN POLICY</Text>
+        {/* @ts-ignore — native <select> on web */}
+        <select value={value} onChange={(e: any) => onChange(e.target.value)} style={webSelectStyle}>
+          {RETURN_POLICY_OPTIONS.map(o => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+      </View>
+    );
+  }
+  return <EditField label="RETURN POLICY" value={value} onChangeText={onChange} />;
+};
+
 const EditMultiField = ({
   label, values, onChange,
 }: {
@@ -112,11 +142,25 @@ const EditMultiField = ({
   </View>
 );
 
-// Suggestion row: label + value + copy arrow button
+const arraysEqual = (a: string[], b: string[]) =>
+  a.length === b.length && a.every((v, i) => v === b[i]);
+
+// Normalize a part number for comparison: strip dashes/spaces, uppercase
+const normPn = (s: string) => s.replace(/[-\s]/g, '').toUpperCase();
+
+// True if every suggested MPN (and interchangeable PNs) appears somewhere in the draft values
+const isMpnApplied = (draftValues: string[], e: EnhancementResult): boolean => {
+  if (!e.manufacturerPartNumber && !e.interchangeablePartNumbers?.length) return false;
+  const draftFlat = normPn(draftValues.join(' '));
+  const pns = [e.manufacturerPartNumber, ...(e.interchangeablePartNumbers || [])].filter(Boolean);
+  return pns.every(pn => draftFlat.includes(normPn(pn)));
+};
+
+// Suggestion row: label + value + copy arrow (or green checkmark if already applied)
 const SuggestionField = ({
-  label, value, onApply,
+  label, value, onApply, isApplied,
 }: {
-  label: string; value: string; onApply?: () => void;
+  label: string; value: string; onApply?: () => void; isApplied?: boolean;
 }) => {
   if (!value) return null;
   return (
@@ -126,18 +170,20 @@ const SuggestionField = ({
         <Text style={styles.fieldValue}>{value}</Text>
       </View>
       {onApply && (
-        <TouchableOpacity onPress={onApply} style={styles.applyBtn}>
-          <Text style={styles.applyBtnText}>←</Text>
-        </TouchableOpacity>
+        isApplied
+          ? <View style={styles.checkBtn}><Text style={styles.checkBtnText}>✓</Text></View>
+          : <TouchableOpacity onPress={onApply} style={styles.applyBtn}>
+              <Text style={styles.applyBtnText}>←</Text>
+            </TouchableOpacity>
       )}
     </View>
   );
 };
 
 const SuggestionBulletList = ({
-  label, items, onApply,
+  label, items, onApply, isApplied,
 }: {
-  label: string; items: string[]; onApply?: () => void;
+  label: string; items: string[]; onApply?: () => void; isApplied?: boolean;
 }) => {
   if (!items?.length) return null;
   return (
@@ -149,34 +195,137 @@ const SuggestionBulletList = ({
         ))}
       </View>
       {onApply && (
-        <TouchableOpacity onPress={onApply} style={styles.applyBtn}>
-          <Text style={styles.applyBtnText}>←</Text>
-        </TouchableOpacity>
+        isApplied
+          ? <View style={styles.checkBtn}><Text style={styles.checkBtnText}>✓</Text></View>
+          : <TouchableOpacity onPress={onApply} style={styles.applyBtn}>
+              <Text style={styles.applyBtnText}>←</Text>
+            </TouchableOpacity>
       )}
+    </View>
+  );
+};
+
+// Returns a datetime-local string (YYYY-MM-DDTHH:MM) set to 6am the day after
+// the latest scheduled date, or 6am tomorrow if nothing is scheduled yet.
+const defaultScheduleDate = (allScheduledDates: string[]): string => {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const validDates = allScheduledDates
+    .filter(Boolean)
+    .map(d => new Date(d))
+    .filter(d => !isNaN(d.getTime()));
+
+  let base: Date;
+  if (validDates.length === 0) {
+    base = new Date();
+    base.setDate(base.getDate() + 1);
+  } else {
+    const latest = new Date(Math.max(...validDates.map(d => d.getTime())));
+    base = new Date(latest);
+    base.setDate(base.getDate() + 1);
+  }
+  return `${base.getFullYear()}-${pad(base.getMonth() + 1)}-${pad(base.getDate())}T06:00`;
+};
+
+// Approximate 2026 USPS Priority Mail commercial base rates
+const USPS_RATE_TABLE = [
+  { max: 1,  label: '≤1 lb',   rate: 9.25 },
+  { max: 2,  label: '≤2 lbs',  rate: 10.20 },
+  { max: 3,  label: '≤3 lbs',  rate: 11.10 },
+  { max: 5,  label: '≤5 lbs',  rate: 12.50 },
+  { max: 10, label: '≤10 lbs', rate: 15.30 },
+  { max: 15, label: '≤15 lbs', rate: 19.10 },
+  { max: 20, label: '≤20 lbs', rate: 22.75 },
+  { max: 25, label: '≤25 lbs', rate: 26.50 },
+  { max: 70, label: '≤70 lbs', rate: 54.20 },
+];
+
+// Returns billable weight using dimensional weight formula (L×W×H / 139)
+const getUspsBillableWeight = (weight: string, length: string, width: string, height: string): number => {
+  const w = parseFloat(weight);
+  if (!w || isNaN(w)) return 0;
+  const l = parseFloat(length);
+  const wd = parseFloat(width);
+  const h = parseFloat(height);
+  const dimWeight = (l > 0 && wd > 0 && h > 0) ? (l * wd * h / 139) : 0;
+  return Math.max(w, dimWeight);
+};
+
+const estimateUspsRange = (weight: string, length: string, width: string, height: string): string => {
+  const billable = getUspsBillableWeight(weight, length, width, height);
+  if (billable <= 0) return '';
+  const entry = USPS_RATE_TABLE.find(r => billable <= r.max);
+  if (!entry) return '';
+  return `~$${(entry.rate * 0.85).toFixed(2)}–$${(entry.rate * 1.15).toFixed(2)}`;
+};
+
+// Dropdown for selecting a USPS Priority rate tier; highlights suggested tier based on billable weight
+const ShippingRatePicker = ({
+  value, onChange, billableWeight,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  billableWeight: number;
+}) => {
+  const suggestedRate = billableWeight > 0 ? USPS_RATE_TABLE.find(r => billableWeight <= r.max) : null;
+  if (Platform.OS !== 'web') return null;
+  return (
+    <View style={styles.field}>
+      <Text style={styles.fieldLabel}>USPS PRIORITY RATE TABLE</Text>
+      {/* @ts-ignore — native <select> on web */}
+      <select
+        value={USPS_RATE_TABLE.find(r => r.rate.toFixed(2) === value)?.rate.toFixed(2) ?? ''}
+        onChange={(e: any) => { if (e.target.value) onChange(e.target.value); }}
+        style={webSelectStyle}
+      >
+        <option value="">— select tier —</option>
+        {USPS_RATE_TABLE.map(tier => (
+          <option key={tier.max} value={tier.rate.toFixed(2)}>
+            {tier.label}  —  ${tier.rate.toFixed(2)}{suggestedRate?.max === tier.max ? '  ✓ suggested' : ''}
+          </option>
+        ))}
+      </select>
     </View>
   );
 };
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export const DraftCard = ({ draft, index }: DraftCardProps) => {
+export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], descTemplates = [], onTemplateAdded, onTemplateDeleted, rateTables = [] }: DraftCardProps) => {
   const [enhancing, setEnhancing] = useState(false);
   const [enhancement, setEnhancement] = useState<EnhancementResult | null>(null);
   const [enhanceError, setEnhanceError] = useState<string | null>(null);
+
+  const initialReturnPolicyChoice = (() => {
+    const rp = draft.returnPolicy;
+    if (!rp || !rp.returnsAccepted) return rp ? 'NO_RETURNS' : 'BUYER_PAYS_30';
+    return rp.returnShippingCostPayer === 'SELLER' ? 'FREE_RETURNS' : 'BUYER_PAYS_30';
+  })();
 
   const [editData, setEditData] = useState({
     title:                draft.title                || '',
     condition:            draft.condition            || 'USED_GOOD',
     conditionDescription: draft.conditionDescription || '',
+    returnPolicyChoice:   initialReturnPolicyChoice,
     description:          draft.listingDescription   || '',
     quantity:             String(draft.quantity ?? 0),
     aspects: Object.fromEntries(
       Object.entries(draft.aspects || {}).map(([k, v]) => [k, [...v]])
     ) as Record<string, string[]>,
+    scheduled:    !!draft.scheduledDate,
+    scheduledDate: draft.scheduledDate || '',
+    packageWeight: draft.packageWeight != null ? String(draft.packageWeight) : '',
+    packageLength: draft.packageLength != null ? String(draft.packageLength) : '',
+    packageWidth:  draft.packageWidth  != null ? String(draft.packageWidth)  : '',
+    packageHeight: draft.packageHeight != null ? String(draft.packageHeight) : '',
+    shippingCost:  draft.shippingCost  || '',
+    rateTableId:   draft.rateTableId   || '',
   });
 
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [publishResult, setPublishResult] = useState<{ listingId?: string; errors?: string[] } | null>(null);
 
   const setField = (key: keyof Omit<typeof editData, 'aspects'>) => (val: string) =>
     setEditData(prev => ({ ...prev, [key]: val }));
@@ -210,6 +359,55 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
     }));
   };
 
+  const handlePublish = async () => {
+    setPublishing(true);
+    setPublishResult(null);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/publish-listing`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sku: draft.sku }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        const listingId = data.listings?.[0]?.listingId;
+        setPublishResult({ listingId });
+      } else {
+        const errors = (data.errors || []).map((e: any) =>
+          e.longMessage || e.message || JSON.stringify(e)
+        );
+        setPublishResult({ errors });
+      }
+    } catch (err) {
+      setPublishResult({ errors: [err instanceof Error ? err.message : 'Unknown error'] });
+    } finally {
+      setPublishing(false);
+    }
+  };
+
+  const handleSaveDescTemplate = async () => {
+    const text = editData.description.trim();
+    if (!text) return;
+    const name = (window as any).prompt?.('Template name:')?.trim();
+    if (!name) return;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/description-templates`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, text }),
+      });
+      const data = await res.json();
+      if (res.ok) onTemplateAdded?.({ name, text });
+    } catch (_) {}
+  };
+
+  const handleDeleteDescTemplate = async (name: string) => {
+    try {
+      await fetch(`${BACKEND_URL}/api/description-templates/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      onTemplateDeleted?.(name);
+    } catch (_) {}
+  };
+
   const handleSave = async () => {
     setSaving(true);
     setSaveMessage(null);
@@ -217,7 +415,17 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
       const res = await fetch(`${BACKEND_URL}/api/listings/${draft.sku}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(editData),
+        body: JSON.stringify({
+          ...editData,
+          returnPolicyChoice: editData.returnPolicyChoice,
+          scheduledDate: editData.scheduled ? (editData.scheduledDate || null) : null,
+          weight: editData.packageWeight || undefined,
+          length: editData.packageLength || undefined,
+          width:  editData.packageWidth  || undefined,
+          height: editData.packageHeight || undefined,
+          shippingCost: editData.shippingCost || undefined,
+          rateTableId: editData.rateTableId || undefined,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error?.message || JSON.stringify(data.error) || 'Save failed');
@@ -227,6 +435,20 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
       setSaveMessage(err instanceof Error ? err.message : 'Save failed');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/listings/${draft.sku}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || JSON.stringify(data.error) || 'Delete failed');
+      onDelete?.(draft.sku);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Delete failed');
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -251,6 +473,8 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
   };
 
   const aspectEntries = Object.entries(editData.aspects);
+  const billableWeight = getUspsBillableWeight(editData.packageWeight, editData.packageLength, editData.packageWidth, editData.packageHeight);
+  const uspsEstimate = estimateUspsRange(editData.packageWeight, editData.packageLength, editData.packageWidth, editData.packageHeight);
 
   return (
     <View style={styles.card}>
@@ -263,15 +487,25 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
         </ScrollView>
       )}
 
-      {/* Title — editable, full width */}
+      {/* Title row with delete button */}
       <View style={styles.titleRow}>
         <TextInput
-          style={styles.titleInput}
+          style={[styles.titleInput, { flex: 1 }]}
           value={editData.title}
           onChangeText={setField('title')}
           placeholder="Title"
           placeholderTextColor="#aaa"
         />
+        <TouchableOpacity
+          onPress={handleDelete}
+          disabled={deleting}
+          style={[styles.deleteBtn, deleting && styles.deleteBtnDisabled]}
+        >
+          {deleting
+            ? <ActivityIndicator size="small" color="#fff" />
+            : <Text style={styles.deleteBtnText}>Delete</Text>
+          }
+        </TouchableOpacity>
       </View>
 
       {/* Two-column body */}
@@ -283,11 +517,135 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
 
           <ReadField label="SKU" value={draft.sku} />
           <ReadField label="STATUS" value={draft.status || ''} />
+          <ReturnPolicyPicker value={editData.returnPolicyChoice} onChange={setField('returnPolicyChoice')} />
 
           <ConditionPicker value={editData.condition} onChange={setField('condition')} />
           <EditField label="CONDITION NOTES" value={editData.conditionDescription} onChangeText={setField('conditionDescription')} />
           <EditField label="QUANTITY" value={editData.quantity} onChangeText={setField('quantity')} />
-          <EditField label="DESCRIPTION" value={editData.description} onChangeText={setField('description')} multiline />
+
+          {/* Shipping */}
+          <View style={styles.shippingBlock}>
+            <Text style={styles.sectionLabel}>SHIPPING</Text>
+            <View style={styles.dimRow}>
+              <View style={styles.dimField}>
+                <Text style={styles.fieldLabel}>WEIGHT (lbs)</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editData.packageWeight}
+                  onChangeText={setField('packageWeight')}
+                  keyboardType="decimal-pad"
+                  placeholder="0.0"
+                  placeholderTextColor="#aaa"
+                />
+              </View>
+              <View style={styles.dimField}>
+                <Text style={styles.fieldLabel}>L (in)</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editData.packageLength}
+                  onChangeText={setField('packageLength')}
+                  keyboardType="decimal-pad"
+                  placeholder="0"
+                  placeholderTextColor="#aaa"
+                />
+              </View>
+              <View style={styles.dimField}>
+                <Text style={styles.fieldLabel}>W (in)</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editData.packageWidth}
+                  onChangeText={setField('packageWidth')}
+                  keyboardType="decimal-pad"
+                  placeholder="0"
+                  placeholderTextColor="#aaa"
+                />
+              </View>
+              <View style={styles.dimField}>
+                <Text style={styles.fieldLabel}>H (in)</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editData.packageHeight}
+                  onChangeText={setField('packageHeight')}
+                  keyboardType="decimal-pad"
+                  placeholder="0"
+                  placeholderTextColor="#aaa"
+                />
+              </View>
+            </View>
+            {!!uspsEstimate && (
+              <Text style={styles.shippingEstimate}>USPS Priority: {uspsEstimate}</Text>
+            )}
+            {/* eBay rate table selector — uses tables configured in Seller Hub */}
+            {rateTables.length > 0 && Platform.OS === 'web' && (
+              <View style={styles.field}>
+                <Text style={styles.fieldLabel}>EBAY RATE TABLE (regional pricing)</Text>
+                {/* @ts-ignore — native <select> on web */}
+                <select
+                  value={editData.rateTableId}
+                  onChange={(e: any) => setField('rateTableId')(e.target.value)}
+                  style={webSelectStyle}
+                >
+                  <option value="">— none (use flat rate below) —</option>
+                  {rateTables.map(rt => (
+                    <option key={rt.rateTableId} value={rt.rateTableId}>
+                      {rt.name}{rt.type ? ` (${rt.type})` : ''}
+                    </option>
+                  ))}
+                </select>
+              </View>
+            )}
+            <ShippingRatePicker
+              value={editData.shippingCost}
+              onChange={setField('shippingCost')}
+              billableWeight={billableWeight}
+            />
+            <View style={[styles.field, !!editData.rateTableId && styles.fieldDimmed]}>
+              <Text style={styles.fieldLabel}>FLAT RATE SHIPPING (USD){editData.rateTableId ? ' — overridden by rate table' : ''}</Text>
+              <TextInput
+                style={styles.input}
+                value={editData.shippingCost}
+                onChangeText={setField('shippingCost')}
+                keyboardType="decimal-pad"
+                placeholder="0.00"
+                placeholderTextColor="#aaa"
+              />
+            </View>
+          </View>
+
+          {/* Description with template dropdown */}
+          <View style={styles.field}>
+            <View style={styles.descLabelRow}>
+              <Text style={styles.fieldLabel}>DESCRIPTION</Text>
+              <TouchableOpacity onPress={handleSaveDescTemplate}>
+                <Text style={styles.saveTemplateLink}>+ Save as template</Text>
+              </TouchableOpacity>
+            </View>
+            {descTemplates.length > 0 && Platform.OS === 'web' && (
+              // @ts-ignore — native <select> on web
+              <select
+                defaultValue=""
+                onChange={(e: any) => {
+                  if (e.target.value) {
+                    setEditData(prev => ({ ...prev, description: e.target.value }));
+                    e.target.value = '';
+                  }
+                }}
+                style={{ ...webSelectStyle, marginBottom: 4 }}
+              >
+                <option value="" disabled>Load template…</option>
+                {descTemplates.map((t, i) => (
+                  <option key={i} value={t.text}>{t.name}</option>
+                ))}
+              </select>
+            )}
+            <TextInput
+              style={[styles.input, styles.inputMultiline]}
+              value={editData.description}
+              onChangeText={setField('description')}
+              multiline
+              numberOfLines={3}
+            />
+          </View>
 
           {aspectEntries.length > 0 && (
             <View style={styles.aspectsBlock}>
@@ -300,6 +658,49 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
                   onChange={setAspectValues(key)}
                 />
               ))}
+            </View>
+          )}
+
+          {/* Schedule toggle */}
+          <TouchableOpacity
+            style={[styles.scheduleToggle, editData.scheduled && styles.scheduleToggleOn]}
+            onPress={() => setEditData(prev => ({
+              ...prev,
+              scheduled: !prev.scheduled,
+              scheduledDate: !prev.scheduled && !prev.scheduledDate
+                ? defaultScheduleDate(allScheduledDates)
+                : prev.scheduledDate,
+            }))}
+            activeOpacity={0.8}
+          >
+            <View style={[styles.scheduleCheckbox, editData.scheduled && styles.scheduleCheckboxOn]}>
+              {editData.scheduled && <Text style={styles.scheduleCheckmark}>✓</Text>}
+            </View>
+            <Text style={[styles.scheduleToggleLabel, editData.scheduled && styles.scheduleToggleLabelOn]}>
+              {editData.scheduled ? 'Scheduled' : 'Schedule listing'}
+            </Text>
+          </TouchableOpacity>
+
+          {editData.scheduled && (
+            <View style={styles.field}>
+              <Text style={styles.fieldLabel}>SCHEDULED DATE</Text>
+              {Platform.OS === 'web' ? (
+                // @ts-ignore — native datetime-local on web
+                <input
+                  type="datetime-local"
+                  value={editData.scheduledDate}
+                  onChange={(e: any) => setEditData(prev => ({ ...prev, scheduledDate: e.target.value }))}
+                  style={webDateInputStyle}
+                />
+              ) : (
+                <TextInput
+                  style={styles.input}
+                  value={editData.scheduledDate}
+                  onChangeText={(v) => setEditData(prev => ({ ...prev, scheduledDate: v }))}
+                  placeholder="YYYY-MM-DDTHH:MM"
+                  placeholderTextColor="#aaa"
+                />
+              )}
             </View>
           )}
 
@@ -317,6 +718,27 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
             <Text style={[styles.saveMessage, saveMessage === 'Saved' ? styles.saveMessageOk : styles.saveMessageErr]}>
               {saveMessage}
             </Text>
+          )}
+
+          {/* Publish */}
+          <TouchableOpacity
+            style={[styles.publishButton, publishing && styles.publishButtonDisabled]}
+            onPress={handlePublish}
+            disabled={publishing}
+          >
+            {publishing
+              ? <ActivityIndicator size="small" color="#fff" />
+              : <Text style={styles.publishButtonText}>List on eBay</Text>
+            }
+          </TouchableOpacity>
+          {publishResult && (
+            publishResult.listingId
+              ? <Text style={styles.publishSuccess}>Listed! ID: {publishResult.listingId}</Text>
+              : <View style={styles.publishErrors}>
+                  {(publishResult.errors || []).map((e, i) => (
+                    <Text key={i} style={styles.publishErrorText}>• {e}</Text>
+                  ))}
+                </View>
           )}
         </View>
 
@@ -338,7 +760,12 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
           )}
           {enhanceError && <Text style={styles.errorText}>{enhanceError}</Text>}
 
-          {enhancement && (
+          {enhancement && (() => {
+            const interchangeTarget = [
+              ...enhancement.years.filter(Boolean),
+              ...enhancement.keywords.filter(Boolean),
+            ];
+            return (
             <View style={styles.suggestionFields}>
               {/* Apply All */}
               <TouchableOpacity onPress={() => applyAll(enhancement)} style={styles.applyAllBtn}>
@@ -349,46 +776,47 @@ export const DraftCard = ({ draft, index }: DraftCardProps) => {
                 label="TITLE (80 chars max)"
                 value={enhancement.title}
                 onApply={() => setField('title')(enhancement.title)}
+                isApplied={editData.title.toLowerCase() === enhancement.title.toLowerCase()}
               />
               <SuggestionField
                 label="BRAND"
                 value={enhancement.brand}
                 onApply={() => setAspectValues('Brand')([enhancement.brand])}
+                isApplied={editData.aspects['Brand']?.[0] === enhancement.brand}
               />
               <SuggestionField
                 label="MANUFACTURER PART NUMBER → Manufacturer Part Number"
                 value={[enhancement.manufacturerPartNumber, ...enhancement.interchangeablePartNumbers].filter(Boolean).join(' ')}
                 onApply={() => setAspectValues('Manufacturer Part Number')(buildMpnAspect(enhancement))}
+                isApplied={isMpnApplied(editData.aspects['Manufacturer Part Number'] || [], enhancement)}
               />
               <ReadField label="PLACEMENT" value={enhancement.placement} />
 
               <SuggestionBulletList
                 label="YEAR → Interchange Part Number"
                 items={enhancement.years}
-                onApply={() => setAspectValues('Interchange Part Number')([
-                  ...enhancement.years.filter(Boolean),
-                  ...enhancement.keywords.filter(Boolean),
-                ])}
+                onApply={() => setAspectValues('Interchange Part Number')(interchangeTarget)}
+                isApplied={enhancement.years.filter(Boolean).every(y => (editData.aspects['Interchange Part Number'] || []).includes(y))}
               />
               <SuggestionBulletList
                 label="MAKE / MODEL → Superseded Part Number"
                 items={enhancement.makeModels}
                 onApply={() => setAspectValues('Superseded Part Number')(enhancement.makeModels.filter(Boolean))}
+                isApplied={enhancement.makeModels.filter(Boolean).every(m => (editData.aspects['Superseded Part Number'] || []).includes(m))}
               />
               <SuggestionBulletList
                 label="KEYWORDS → Interchange Part Number"
                 items={enhancement.keywords}
-                onApply={() => setAspectValues('Interchange Part Number')([
-                  ...enhancement.years.filter(Boolean),
-                  ...enhancement.keywords.filter(Boolean),
-                ])}
+                onApply={() => setAspectValues('Interchange Part Number')(interchangeTarget)}
+                isApplied={enhancement.keywords.filter(Boolean).every(k => (editData.aspects['Interchange Part Number'] || []).includes(k))}
               />
               <SuggestionBulletList
                 label="SUPERSEDE PART NUMBERS"
                 items={enhancement.supersedePartNumbers}
               />
             </View>
-          )}
+            );
+          })()}
         </View>
       </View>
 
@@ -418,6 +846,17 @@ const webSelectStyle = {
   width: '100%',
 };
 
+const webDateInputStyle = {
+  fontSize: 13,
+  color: '#222',
+  border: '1px solid #e0e0e0',
+  borderRadius: 4,
+  padding: '4px 8px',
+  backgroundColor: '#fafafa',
+  width: '100%',
+  marginTop: 4,
+};
+
 const styles = StyleSheet.create({
   card: {
     backgroundColor: '#fff',
@@ -432,7 +871,18 @@ const styles = StyleSheet.create({
   },
   imageRow: { flexDirection: 'row' },
   image: { width: 120, height: 120, marginRight: 4 },
-  titleRow: { paddingHorizontal: 15, paddingTop: 12, paddingBottom: 8 },
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 15, paddingTop: 12, paddingBottom: 8 },
+  deleteBtn: {
+    backgroundColor: '#d32f2f',
+    borderRadius: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 60,
+  },
+  deleteBtnDisabled: { backgroundColor: '#ef9a9a' },
+  deleteBtnText: { color: '#fff', fontWeight: '600', fontSize: 12 },
   titleInput: {
     fontSize: 15,
     fontWeight: 'bold',
@@ -526,6 +976,16 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   applyBtnText: { fontSize: 13, color: '#7c3aed', fontWeight: '700' },
+  checkBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: '#e8f5e9',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 14,
+  },
+  checkBtnText: { fontSize: 14, color: '#2e7d32', fontWeight: '700' },
   applyAllBtn: {
     backgroundColor: '#7c3aed',
     borderRadius: 6,
@@ -535,4 +995,56 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   applyAllBtnText: { color: '#fff', fontWeight: '600', fontSize: 12 },
+  scheduleToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+    backgroundColor: '#fafafa',
+  },
+  scheduleToggleOn: {
+    borderColor: '#1565c0',
+    backgroundColor: '#e3f2fd',
+  },
+  scheduleCheckbox: {
+    width: 20,
+    height: 20,
+    borderRadius: 4,
+    borderWidth: 2,
+    borderColor: '#bdbdbd',
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  scheduleCheckboxOn: {
+    borderColor: '#1565c0',
+    backgroundColor: '#1565c0',
+  },
+  scheduleCheckmark: { fontSize: 13, color: '#fff', fontWeight: '800', lineHeight: 16 },
+  scheduleToggleLabel: { fontSize: 13, color: '#888', fontWeight: '500' },
+  scheduleToggleLabelOn: { color: '#1565c0', fontWeight: '700' },
+  descLabelRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  saveTemplateLink: { fontSize: 11, color: '#1976d2', fontWeight: '600' },
+  publishButton: {
+    backgroundColor: '#2e7d32',
+    borderRadius: 6,
+    paddingVertical: 8,
+    alignItems: 'center',
+    marginTop: 6,
+  },
+  publishButtonDisabled: { backgroundColor: '#81c784' },
+  publishButtonText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  publishSuccess: { fontSize: 12, color: '#2e7d32', fontWeight: '600', marginTop: 4, textAlign: 'center' },
+  publishErrors: { marginTop: 6, backgroundColor: '#fff3e0', borderRadius: 6, padding: 8, gap: 4 },
+  publishErrorText: { fontSize: 12, color: '#bf360c', lineHeight: 17 },
+  shippingBlock: { gap: 6, marginTop: 4, padding: 8, backgroundColor: '#f8f8f8', borderRadius: 6, borderWidth: 1, borderColor: '#e0e0e0' },
+  dimRow: { flexDirection: 'row', gap: 6 },
+  dimField: { flex: 1 },
+  shippingEstimate: { fontSize: 12, color: '#388e3c', fontWeight: '600', fontStyle: 'italic' },
+  fieldDimmed: { opacity: 0.45 },
 });

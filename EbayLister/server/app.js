@@ -41,7 +41,7 @@ const APP_URL = process.env.APP_URL || 'http://localhost:8081';
 
 const DYNAMODB_TABLE = process.env.DYNAMODB_TABLE_NAME;
 
-let memoryStore = { user: null, app: null, skus: [] };
+let memoryStore = { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {} };
 let dynamoCache = null;
 
 async function loadTokens() {
@@ -56,10 +56,15 @@ async function loadTokens() {
   }));
 
   dynamoCache = result.Item ? {
-    user: result.Item.userToken ? JSON.parse(result.Item.userToken.S) : null,
-    app:  result.Item.appToken  ? JSON.parse(result.Item.appToken.S)  : null,
-    skus: result.Item.skus      ? JSON.parse(result.Item.skus.S)      : [],
-  } : { user: null, app: null, skus: [] };
+    user:          result.Item.userToken     ? JSON.parse(result.Item.userToken.S)      : null,
+    app:           result.Item.appToken      ? JSON.parse(result.Item.appToken.S)       : null,
+    skus:                    result.Item.skus                    ? JSON.parse(result.Item.skus.S)                    : [],
+    skuSchedules:            result.Item.skuSchedules            ? JSON.parse(result.Item.skuSchedules.S)            : {},
+    descTemplates:           result.Item.descTemplates           ? JSON.parse(result.Item.descTemplates.S)           : [],
+    skuFulfillmentPolicies:  result.Item.skuFulfillmentPolicies  ? JSON.parse(result.Item.skuFulfillmentPolicies.S)  : {},
+    skuShippingCosts:        result.Item.skuShippingCosts        ? JSON.parse(result.Item.skuShippingCosts.S)        : {},
+    skuRateTables:           result.Item.skuRateTables           ? JSON.parse(result.Item.skuRateTables.S)           : {},
+  } : { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {} };
 
   return dynamoCache;
 }
@@ -74,11 +79,16 @@ async function saveTokens(tokens) {
   await client.send(new PutItemCommand({
     TableName: DYNAMODB_TABLE,
     Item: {
-      userId:    { S: 'default' },
-      userToken: { S: JSON.stringify(tokens.user) },
-      appToken:  { S: JSON.stringify(tokens.app) },
-      skus:      { S: JSON.stringify(tokens.skus || []) },
-      updatedAt: { S: new Date().toISOString() },
+      userId:       { S: 'default' },
+      userToken:    { S: JSON.stringify(tokens.user) },
+      appToken:     { S: JSON.stringify(tokens.app) },
+      skus:                   { S: JSON.stringify(tokens.skus || []) },
+      skuSchedules:           { S: JSON.stringify(tokens.skuSchedules || {}) },
+      descTemplates:          { S: JSON.stringify(tokens.descTemplates || []) },
+      skuFulfillmentPolicies: { S: JSON.stringify(tokens.skuFulfillmentPolicies || {}) },
+      skuShippingCosts:       { S: JSON.stringify(tokens.skuShippingCosts || {}) },
+      skuRateTables:          { S: JSON.stringify(tokens.skuRateTables || {}) },
+      updatedAt:    { S: new Date().toISOString() },
     },
   }));
 }
@@ -88,6 +98,8 @@ async function saveTokens(tokens) {
 const SCOPES = [
   'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
+  'https://api.ebay.com/oauth/api_scope/sell.account',
+  'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
 ].join(' ');
 
 const OAUTH_URL = EBAY_ENV === 'sandbox'
@@ -156,6 +168,67 @@ async function addSKU(sku) {
   if (!skus.includes(sku)) {
     await saveTokens({ ...stored, skus: [...skus, sku] });
   }
+}
+
+async function removeSKU(sku) {
+  const stored = await loadTokens();
+  const skuSchedules = { ...(stored.skuSchedules || {}) };
+  delete skuSchedules[sku];
+  await saveTokens({ ...stored, skus: (stored.skus || []).filter(s => s !== sku), skuSchedules });
+}
+
+async function setSkuSchedule(sku, date) {
+  const stored = await loadTokens();
+  const skuSchedules = { ...(stored.skuSchedules || {}), [sku]: date };
+  await saveTokens({ ...stored, skuSchedules });
+}
+
+async function clearSkuSchedule(sku) {
+  const stored = await loadTokens();
+  const skuSchedules = { ...(stored.skuSchedules || {}) };
+  delete skuSchedules[sku];
+  await saveTokens({ ...stored, skuSchedules });
+}
+
+async function getOrUpdateSkuFulfillmentPolicy(token, sku, shippingCost, rateTableId) {
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+  const stored = await loadTokens();
+  const existingId = (stored.skuFulfillmentPolicies || {})[sku];
+
+  // Build the shipping service — omit shippingCost when a rate table is used (table provides pricing)
+  const shippingService = {
+    shippingCarrierCode: 'USPS',
+    shippingServiceCode: 'USPSPriority',
+    freeShipping: false,
+    additionalShippingCost: { value: '0.00', currency: 'USD' },
+    ...(!rateTableId && shippingCost ? { shippingCost: { value: parseFloat(shippingCost).toFixed(2), currency: 'USD' } } : {}),
+  };
+
+  const shippingOption = {
+    optionType: 'DOMESTIC',
+    costType: 'FLAT_RATE',
+    shippingServices: [shippingService],
+    ...(rateTableId ? { rateTableId } : {}),
+  };
+
+  const policyBody = {
+    name: `EbayLister-${sku}`,
+    marketplaceId: 'EBAY_US',
+    categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+    handlingTime: { value: 3, unit: 'DAY' },
+    shippingOptions: [shippingOption],
+  };
+
+  if (existingId) {
+    await axios.put(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy/${existingId}`, policyBody, { headers });
+    return existingId;
+  }
+
+  const res = await axios.post(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy`, policyBody, { headers });
+  const policyId = res.data.fulfillmentPolicyId;
+  const skuFulfillmentPolicies = { ...(stored.skuFulfillmentPolicies || {}), [sku]: policyId };
+  await saveTokens({ ...stored, skuFulfillmentPolicies });
+  return policyId;
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -251,6 +324,7 @@ app.post('/auth/tokens', async (req, res) => {
   }
   const stored = await loadTokens();
   await saveTokens({ ...stored, user: { accessToken, refreshToken, expiresAt } });
+  dynamoCache = null;
   console.log('✓ Tokens updated from client');
   res.json({ success: true });
 });
@@ -276,7 +350,12 @@ app.post('/auth/refresh', async (req, res) => {
 });
 
 app.get('/api/listings', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   try {
+    const stored = await loadTokens();
+    const skuSchedules = stored.skuSchedules || {};
+    const skuShippingCosts = stored.skuShippingCosts || {};
+    const skuRateTables = stored.skuRateTables || {};
     const token = await getUserAccessToken();
     const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
 
@@ -305,15 +384,169 @@ app.get('/api/listings', async (req, res) => {
       };
     }));
 
-    res.json({ listings });
+    // Resolve unique return policy IDs to their details
+    const allOffers = listings.flatMap(l => l.offers);
+    const policyIds = [...new Set(allOffers.map(o => o.listingPolicies?.returnPolicyId).filter(Boolean))];
+    const policyMap = {};
+    await Promise.all(policyIds.map(async (id) => {
+      try {
+        const r = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/return_policy/${id}`, { headers });
+        policyMap[id] = r.data;
+      } catch (e) { /* policy not found — skip */ }
+    }));
+
+    const listingsWithPolicies = listings.map(l => ({
+      ...l,
+      scheduledDate: skuSchedules[l.sku] || null,
+      shippingCost: skuShippingCosts[l.sku] || null,
+      rateTableId: skuRateTables[l.sku] || null,
+      offers: l.offers.map(o => ({
+        ...o,
+        returnPolicy: o.listingPolicies?.returnPolicyId ? (policyMap[o.listingPolicies.returnPolicyId] || null) : null,
+      })),
+    }));
+
+    res.json({ listings: listingsWithPolicies });
   } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || { message: err.message } });
+  }
+});
+
+// Cache policy IDs per choice to avoid redundant lookups
+const returnPolicyCacheMap = {};
+
+const RETURN_POLICY_DEFS = {
+  BUYER_PAYS_30: {
+    name: '30 Day Returns - Buyer Pays',
+    returnsAccepted: true,
+    returnPeriod: { value: 30, unit: 'DAY' },
+    returnShippingCostPayer: 'BUYER',
+    refundMethod: 'MONEY_BACK',
+    match: p => p.returnsAccepted && p.returnPeriod?.value === 30 && p.returnShippingCostPayer === 'BUYER',
+  },
+  FREE_RETURNS: {
+    name: '30 Day Free Returns',
+    returnsAccepted: true,
+    returnPeriod: { value: 30, unit: 'DAY' },
+    returnShippingCostPayer: 'SELLER',
+    refundMethod: 'MONEY_BACK',
+    match: p => p.returnsAccepted && p.returnPeriod?.value === 30 && p.returnShippingCostPayer === 'SELLER',
+  },
+  NO_RETURNS: {
+    name: 'No Returns',
+    returnsAccepted: false,
+    match: p => !p.returnsAccepted,
+  },
+};
+
+let fulfillmentPolicyCacheId = null;
+
+const getOrCreateFulfillmentPolicy = async (token) => {
+  if (fulfillmentPolicyCacheId) return fulfillmentPolicyCacheId;
+
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+
+  try {
+    const res = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers });
+    const existing = (res.data?.fulfillmentPolicies || [])[0];
+    if (existing) {
+      fulfillmentPolicyCacheId = existing.fulfillmentPolicyId;
+      return fulfillmentPolicyCacheId;
+    }
+  } catch (e) {
+    console.log('Could not list fulfillment policies:', e.message);
+  }
+
+  // Create a minimal flat-rate domestic shipping policy
+  const created = await axios.post(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy`, {
+    name: 'Default Shipping',
+    marketplaceId: 'EBAY_US',
+    categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+    handlingTime: { value: 3, unit: 'DAY' },
+    shippingOptions: [{
+      optionType: 'DOMESTIC',
+      costType: 'FLAT_RATE',
+      shippingServices: [{
+        shippingCarrierCode: 'USPS',
+        shippingServiceCode: 'USPSPriority',
+        freeShipping: false,
+        shippingCost: { value: '5.00', currency: 'USD' },
+        additionalShippingCost: { value: '0.00', currency: 'USD' },
+      }],
+    }],
+  }, { headers });
+
+  fulfillmentPolicyCacheId = created.data?.fulfillmentPolicyId;
+  return fulfillmentPolicyCacheId;
+};
+
+const getOrCreateReturnPolicy = async (token, choice = 'BUYER_PAYS_30') => {
+  if (returnPolicyCacheMap[choice]) return returnPolicyCacheMap[choice];
+
+  const def = RETURN_POLICY_DEFS[choice];
+  if (!def) return null;
+
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+
+  try {
+    const res = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/return_policy?marketplace_id=EBAY_US`, { headers });
+    const existing = (res.data?.returnPolicies || []).find(def.match);
+    if (existing) {
+      returnPolicyCacheMap[choice] = existing.returnPolicyId;
+      return returnPolicyCacheMap[choice];
+    }
+  } catch (e) {
+    console.log('Could not list return policies:', e.message);
+  }
+
+  const { match, ...policyBody } = def;
+  const created = await axios.post(`${EBAY_BASE_URL}/sell/account/v1/return_policy`, {
+    ...policyBody,
+    marketplaceId: 'EBAY_US',
+  }, { headers });
+
+  returnPolicyCacheMap[choice] = created.data?.returnPolicyId;
+  return returnPolicyCacheMap[choice];
+};
+
+app.post('/api/listings', async (req, res) => {
+  const { title, imageUrls = [], condition = 'USED_GOOD', price = '0.00', quantity = 1 } = req.body;
+  if (!title) return res.status(400).json({ error: 'title required' });
+
+  try {
+    const sku = `DRAFT-${Date.now()}`;
+    const token = await getUserAccessToken();
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+
+    // Create inventory item (omit imageUrls entirely if none provided — eBay rejects empty array)
+    const filteredUrls = imageUrls.filter(Boolean);
+    const product = filteredUrls.length > 0 ? { title, imageUrls: filteredUrls } : { title };
+    await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+      condition,
+      product,
+      availability: { shipToLocationAvailability: { quantity: parseInt(quantity) } },
+    }, { headers });
+
+    // Create offer (categoryId can be added later before publishing)
+    await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, {
+      sku,
+      marketplaceId: 'EBAY_US',
+      format: 'FIXED_PRICE',
+      listingDescription: title,
+      pricingSummary: { price: { value: price, currency: 'USD' } },
+    }, { headers });
+
+    await addSKU(sku);
+    res.json({ sku });
+  } catch (err) {
+    console.error('Create listing error:', err.response?.data || err.message);
     res.status(err.response?.status || 500).json({ error: err.response?.data || { message: err.message } });
   }
 });
 
 app.put('/api/listings/:sku', async (req, res) => {
   const { sku } = req.params;
-  const { title, condition, conditionDescription, description, quantity, aspects } = req.body;
+  const { title, condition, conditionDescription, description, quantity, aspects, returnPolicyChoice, scheduledDate, weight, length, width, height, shippingCost, rateTableId } = req.body;
 
   try {
     const token = await getUserAccessToken();
@@ -342,11 +575,208 @@ app.put('/api/listings/:sku', async (req, res) => {
       },
     };
 
+    // Update packageWeightAndSize if weight or dimensions provided
+    const hasWeight = weight != null && weight !== '';
+    const hasDims = length != null && length !== '' && width != null && width !== '' && height != null && height !== '';
+    if (hasWeight || hasDims) {
+      updated.packageWeightAndSize = {
+        ...(current.packageWeightAndSize || {}),
+        ...(hasWeight ? { weight: { value: parseFloat(weight), unit: 'POUND' } } : {}),
+        ...(hasDims ? { dimensions: { length: parseFloat(length), width: parseFloat(width), height: parseFloat(height), unit: 'INCH' } } : {}),
+      };
+    }
+
     await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item/${sku}`, updated, { headers });
+
+    // Apply return + fulfillment policies to all offers for this SKU
+    try {
+      let fulfillmentPolicyId;
+      const hasShipping = (shippingCost != null && shippingCost !== '') || (rateTableId != null && rateTableId !== '');
+      if (hasShipping) {
+        // Create/update a per-SKU policy (rate table takes precedence over flat cost)
+        fulfillmentPolicyId = await getOrUpdateSkuFulfillmentPolicy(token, sku, shippingCost, rateTableId);
+        const s2 = await loadTokens();
+        const skuShippingCosts = { ...(s2.skuShippingCosts || {}), [sku]: shippingCost || '' };
+        const skuRateTables = { ...(s2.skuRateTables || {}), [sku]: rateTableId || '' };
+        await saveTokens({ ...s2, skuShippingCosts, skuRateTables });
+      } else {
+        // Use existing per-SKU policy if available, otherwise fall back to default
+        const s = await loadTokens();
+        fulfillmentPolicyId = (s.skuFulfillmentPolicies || {})[sku] || await getOrCreateFulfillmentPolicy(token);
+      }
+      const returnPolicyId = await getOrCreateReturnPolicy(token, returnPolicyChoice || 'BUYER_PAYS_30');
+      const offersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
+      const offers = offersRes.data?.offers || [];
+      await Promise.all(offers.map(async (offer) => {
+        const { offerId, status, listing, ...offerBody } = offer;
+        const updatedOffer = {
+          ...offerBody,
+          listingPolicies: {
+            ...offerBody.listingPolicies,
+            ...(returnPolicyId    ? { returnPolicyId }    : {}),
+            ...(fulfillmentPolicyId ? { fulfillmentPolicyId } : {}),
+          },
+        };
+        await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, updatedOffer, { headers });
+      }));
+    } catch (e) {
+      console.log('Policy update skipped:', e.response?.data || e.message);
+    }
+
+    // Store or clear scheduled date
+    if (scheduledDate) {
+      await setSkuSchedule(sku, scheduledDate);
+    } else if (scheduledDate === null || scheduledDate === '') {
+      await clearSkuSchedule(sku);
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error('Save listing error:', err.response?.data || err.message);
     res.status(err.response?.status || 500).json({ error: err.response?.data || { message: err.message } });
+  }
+});
+
+app.delete('/api/listings/:sku', async (req, res) => {
+  const { sku } = req.params;
+  if (!sku) return res.status(400).json({ error: 'sku required' });
+  try {
+    const token = await getUserAccessToken();
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+
+    const isNotFound = (err) => {
+      const errorId = err.response?.data?.errors?.[0]?.errorId;
+      return err.response?.status === 404 || errorId === 25710 || errorId === 25001;
+    };
+
+    // Delete any offers associated with this SKU first
+    try {
+      const offersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
+      const offers = offersRes.data?.offers || [];
+      await Promise.all(offers.map(o => axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${o.offerId}`, { headers }).catch(() => {})));
+    } catch (_) { /* no offers — continue */ }
+
+    // Delete the inventory item — treat "not found" as success (already gone from eBay)
+    try {
+      await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers });
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+      console.log(`SKU ${sku} already gone from eBay — removing from local store only`);
+    }
+
+    // Clean up per-SKU fulfillment policy from eBay and local store
+    try {
+      const s = await loadTokens();
+      const policyId = (s.skuFulfillmentPolicies || {})[sku];
+      if (policyId) {
+        await axios.delete(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy/${policyId}`, { headers }).catch(() => {});
+      }
+      const skuShippingCosts = { ...(s.skuShippingCosts || {}) };
+      const skuFulfillmentPolicies = { ...(s.skuFulfillmentPolicies || {}) };
+      const skuRateTables = { ...(s.skuRateTables || {}) };
+      delete skuShippingCosts[sku];
+      delete skuFulfillmentPolicies[sku];
+      delete skuRateTables[sku];
+      await saveTokens({ ...s, skuShippingCosts, skuFulfillmentPolicies, skuRateTables });
+    } catch (_) {}
+
+    // Always remove from DynamoDB
+    await removeSKU(sku);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete listing error:', err.response?.data || err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data || { message: err.message } });
+  }
+});
+
+app.get('/api/rate-tables', async (req, res) => {
+  try {
+    const token = await getUserAccessToken();
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+    const r = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/rate_table?marketplace_id=EBAY_US`, { headers });
+    res.json({ rateTables: r.data?.rateTables || [] });
+  } catch (err) {
+    // Return empty list on error so UI degrades gracefully
+    console.log('Rate tables fetch failed:', err.response?.data || err.message);
+    res.json({ rateTables: [] });
+  }
+});
+
+app.get('/api/description-templates', async (req, res) => {
+  const stored = await loadTokens();
+  res.json({ templates: stored.descTemplates || [] });
+});
+
+app.post('/api/description-templates', async (req, res) => {
+  const { name, text } = req.body;
+  if (!name || !text) return res.status(400).json({ error: 'name and text required' });
+  const stored = await loadTokens();
+  const templates = [...(stored.descTemplates || []), { name, text }];
+  await saveTokens({ ...stored, descTemplates: templates });
+  res.json({ templates });
+});
+
+app.delete('/api/description-templates/:name', async (req, res) => {
+  const stored = await loadTokens();
+  const templates = (stored.descTemplates || []).filter(t => t.name !== req.params.name);
+  await saveTokens({ ...stored, descTemplates: templates });
+  res.json({ templates });
+});
+
+app.post('/api/publish-listing', async (req, res) => {
+  const { sku } = req.body;
+  if (!sku) return res.status(400).json({ error: 'sku required' });
+
+  try {
+    const token = await getUserAccessToken();
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+
+    const offersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
+    const offers = offersRes.data?.offers || [];
+    if (offers.length === 0) return res.status(404).json({ success: false, errors: [{ message: 'No offers found for this SKU' }] });
+
+    // Ensure fulfillment policy is attached (required for eBay to know item country)
+    try {
+      const fulfillmentPolicyId = await getOrCreateFulfillmentPolicy(token);
+      if (fulfillmentPolicyId) {
+        await Promise.all(offers.map(async (offer) => {
+          if (!offer.listingPolicies?.fulfillmentPolicyId) {
+            const { offerId, status, listing, ...offerBody } = offer;
+            await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, {
+              ...offerBody,
+              listingPolicies: { ...offerBody.listingPolicies, fulfillmentPolicyId },
+            }, { headers });
+          }
+        }));
+      }
+    } catch (e) {
+      console.log('Fulfillment policy pre-publish attach skipped:', e.response?.data || e.message);
+    }
+
+    const results = await Promise.allSettled(
+      offers.map(offer =>
+        axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offer.offerId}/publish`, {}, { headers })
+          .then(r => ({ offerId: offer.offerId, listingId: r.data.listingId }))
+      )
+    );
+
+    const successes = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+    const failures  = results.filter(r => r.status === 'rejected').map(r => {
+      const errs = r.reason?.response?.data?.errors;
+      return errs ? errs : [{ message: r.reason?.message || 'Unknown error' }];
+    }).flat();
+
+    if (successes.length > 0) {
+      res.json({ success: true, listings: successes, errors: failures });
+    } else {
+      res.status(400).json({ success: false, errors: failures });
+    }
+  } catch (err) {
+    const errs = err.response?.data?.errors;
+    res.status(err.response?.status || 500).json({
+      success: false,
+      errors: errs || [{ message: err.message }],
+    });
   }
 });
 
@@ -386,6 +816,26 @@ app.post('/api/enhance-listing', async (req, res) => {
   }
 });
 
+app.get('/api/diagnose', async (req, res) => {
+  try {
+    const token = await getUserAccessToken();
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+    const result = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item`, { headers })
+      .then(r => ({ status: r.status, data: r.data }))
+      .catch(e => ({ status: e.response?.status, data: e.response?.data, message: e.message }));
+    res.json({ environment: EBAY_ENV, result });
+  } catch (err) {
+    res.json({ environment: EBAY_ENV, error: err.message });
+  }
+});
+
+app.post('/auth/logout', async (req, res) => {
+  const stored = await loadTokens();
+  await saveTokens({ ...stored, user: null });
+  dynamoCache = null;
+  res.json({ success: true });
+});
+
 app.use('/api/ebay', async (req, res) => {
   try {
     const token = await getUserAccessToken();
@@ -399,62 +849,6 @@ app.use('/api/ebay', async (req, res) => {
     res.json(response.data);
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data || { message: err.message } });
-  }
-});
-
-app.get('/test/create-sample-listing', async (req, res) => {
-  try {
-    const token = await getUserAccessToken();
-    const testSKU = 'TEST' + Date.now();
-    const title = req.query.title || 'Test Product - Do Not Buy';
-
-    await axios.put(
-      `${EBAY_BASE_URL}/sell/inventory/v1/inventory_item/${testSKU}`,
-      {
-        product: { title, description: 'Draft created via eBay Lister.', aspects: { Brand: ['Unknown'] }, imageUrls: ['https://via.placeholder.com/500'] },
-        condition: 'NEW',
-        availability: { shipToLocationAvailability: { quantity: 1 } },
-      },
-      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' } }
-    );
-
-    const offerResponse = await axios.post(
-      `${EBAY_BASE_URL}/sell/inventory/v1/offer`,
-      {
-        sku: testSKU, marketplaceId: 'EBAY_US', format: 'FIXED_PRICE',
-        listingDescription: 'Test listing. Do not purchase.', availableQuantity: 1, categoryId: '11450',
-        listingPolicies: { paymentPolicyId: '5914107016', returnPolicyId: '5914105016', fulfillmentPolicyId: '5914106016' },
-        pricingSummary: { price: { value: '9.99', currency: 'USD' } },
-      },
-      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' } }
-    );
-
-    await addSKU(testSKU);
-    res.json({ success: true, sku: testSKU, offerId: offerResponse.data.offerId });
-  } catch (err) {
-    res.status(err.response?.status || 500).json({ error: err.response?.data || { message: err.message } });
-  }
-});
-
-app.get('/test/diagnose-offers', async (req, res) => {
-  try {
-    const token = await getUserAccessToken();
-    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
-    const results = await Promise.allSettled([
-      axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, { headers }),
-      axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, { headers, params: { limit: 10 } }),
-      axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item`, { headers, params: { limit: 10 } }),
-    ]);
-    res.json({
-      success: true,
-      results: results.map((r, i) => ({
-        test: ['No params', 'limit=10', 'inventory_items'][i],
-        status: r.status === 'fulfilled' ? 'SUCCESS' : 'FAILED',
-        data: r.status === 'fulfilled' ? r.value.data : r.reason?.response?.data,
-      })),
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
   }
 });
 

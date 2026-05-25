@@ -4,3 +4,4 @@ export { LoadingIndicator } from './LoadingIndicator';
 export { DraftCard } from './DraftCard';
 export { DraftList } from './DraftList';
 export { Login } from './Login';
+export { NewDraftForm } from './NewDraftForm';

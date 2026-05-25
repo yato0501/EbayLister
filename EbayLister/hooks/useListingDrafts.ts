@@ -22,7 +22,7 @@ export const useListingDrafts = () => {
       setDrafts(listingDrafts);
 
       if (listingDrafts.length === 0) {
-        setError('No listing drafts found. Create some drafts in your eBay Sandbox account.');
+        setError('No listing drafts found.');
       }
     } catch (err) {
       setError(`Error fetching drafts: ${err instanceof Error ? err.message : 'Unknown error'}`);

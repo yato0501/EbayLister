@@ -237,10 +237,10 @@ class EbayService {
     try {
       const isWeb = typeof window !== 'undefined' && !('ReactNative' in window);
       const baseURL = isWeb ? 'https://api.ebay.who-is-tou.com' : '';
-      const response = await axios.get(`${baseURL}/api/listings`);
+      const response = await axios.get(`${baseURL}/api/listings?_=${Date.now()}`);
       const { listings } = response.data;
 
-      return listings.map(({ sku, item, offers }: { sku: string; item: EbayInventoryItem | null; offers: EbayOffer[] }) => {
+      return listings.map(({ sku, item, offers, scheduledDate, shippingCost, rateTableId }: { sku: string; item: EbayInventoryItem | null; offers: EbayOffer[]; scheduledDate?: string | null; shippingCost?: string | null; rateTableId?: string | null }) => {
         const offer = offers[0] || {};
         return {
           offerId:              offer.offerId            || sku,
@@ -258,6 +258,14 @@ class EbayService {
           imageUrls:            item?.product?.imageUrls || [],
           aspects:              item?.product?.aspects   || {},
           quantity:             item?.availability?.shipToLocationAvailability?.quantity ?? 0,
+          returnPolicy:         offer.returnPolicy       || null,
+          scheduledDate:        scheduledDate            || null,
+          packageWeight:        item?.packageWeightAndSize?.weight?.value,
+          packageLength:        item?.packageWeightAndSize?.dimensions?.length,
+          packageWidth:         item?.packageWeightAndSize?.dimensions?.width,
+          packageHeight:        item?.packageWeightAndSize?.dimensions?.height,
+          shippingCost:         shippingCost             || '',
+          rateTableId:          rateTableId              || '',
         } as EbayOffer;
       });
     } catch (error) {

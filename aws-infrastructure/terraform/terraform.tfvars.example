@@ -8,3 +8,10 @@ ebay_sandbox_client_id        = "YOUR_SANDBOX_CLIENT_ID"
 ebay_sandbox_client_secret    = "YOUR_SANDBOX_CLIENT_SECRET"
 ebay_production_client_id     = "YOUR_PRODUCTION_CLIENT_ID"
 ebay_production_client_secret = "YOUR_PRODUCTION_CLIENT_SECRET"
+
+# RuName from developer.ebay.com/my/auth?env=production
+# NOT the same as your Client ID — find it on the OAuth redirect URI page
+# Example: YourName-AppName-PRD-abc12345d-ef678901
+ebay_ru_name = "YourName-AppName-PRD-abc12345d-ef678901"
+
+anthropic_api_key = "sk-ant-api03-..."

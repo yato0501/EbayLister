@@ -1,23 +1,49 @@
 import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, View, Button, Text, TextInput } from 'react-native';
+import { StyleSheet, View, Button, TouchableOpacity, Text } from 'react-native';
 import { useState, useEffect } from 'react';
 import { useListingDrafts } from './hooks/useListingDrafts';
-import { Header, ErrorMessage, LoadingIndicator, DraftList, Login } from './components';
+import { Header, ErrorMessage, LoadingIndicator, DraftList, Login, NewDraftForm } from './components';
 import { AuthService } from './services';
 
 const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
 
+export type DescTemplate = { name: string; text: string };
+export type RateTable = { rateTableId: string; name: string; type: string };
+
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
-  const [creatingDraft, setCreatingDraft] = useState(false);
-  const [createMessage, setCreateMessage] = useState<string | null>(null);
-  const [draftTitle, setDraftTitle] = useState('');
+  const [descTemplates, setDescTemplates] = useState<DescTemplate[]>([]);
+  const [rateTables, setRateTables] = useState<RateTable[]>([]);
+  const [showNewDraftForm, setShowNewDraftForm] = useState(false);
   const { drafts, loading, error, fetchListingDrafts } = useListingDrafts();
 
-  // Check authentication on app startup
   useEffect(() => {
     checkAuth();
+    fetchDescTemplates();
   }, []);
+
+  useEffect(() => {
+    if (isAuthenticated) fetchRateTables();
+  }, [isAuthenticated]);
+
+  const fetchRateTables = async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/rate-tables`);
+      const data = await res.json();
+      setRateTables(data.rateTables || []);
+    } catch (_) {}
+  };
+
+  const fetchDescTemplates = async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/description-templates`);
+      const data = await res.json();
+      setDescTemplates(data.templates || []);
+    } catch (_) {}
+  };
+
+  const handleTemplateAdded = (t: DescTemplate) => setDescTemplates(prev => [...prev, t]);
+  const handleTemplateDeleted = (name: string) => setDescTemplates(prev => prev.filter(t => t.name !== name));
 
   const checkAuth = async () => {
     try {
@@ -33,33 +59,12 @@ export default function App() {
     setIsAuthenticated(true);
   };
 
-  const createSampleDraft = async () => {
-    setCreatingDraft(true);
-    setCreateMessage(null);
-
-    try {
-      const params = draftTitle.trim() ? `?title=${encodeURIComponent(draftTitle.trim())}` : '';
-      const response = await fetch(`${BACKEND_URL}/test/create-sample-listing${params}`);
-
-      if (response.ok) {
-        setCreateMessage('✅ Sample draft created successfully!');
-        // Automatically fetch the updated drafts list
-        setTimeout(() => {
-          fetchListingDrafts();
-          setCreateMessage(null);
-        }, 2000);
-      } else {
-        setCreateMessage('❌ Failed to create sample draft');
-      }
-    } catch (err) {
-      console.error('Error creating sample draft:', err);
-      setCreateMessage('❌ Error creating sample draft');
-    } finally {
-      setCreatingDraft(false);
-    }
+  const handleSignOut = async () => {
+    await AuthService.logout();
+    await fetch(`${BACKEND_URL}/auth/logout`, { method: 'POST' }).catch(() => {});
+    setIsAuthenticated(false);
   };
 
-  // Show loading while checking auth
   if (isAuthenticated === null) {
     return (
       <View style={styles.container}>
@@ -69,7 +74,6 @@ export default function App() {
     );
   }
 
-  // Show login screen if not authenticated
   if (!isAuthenticated) {
     return (
       <View style={styles.container}>
@@ -79,47 +83,42 @@ export default function App() {
     );
   }
 
-  // Show main app if authenticated
   return (
     <View style={styles.container}>
       <StatusBar style="auto" />
       <Header />
 
-      <TextInput
-        style={styles.titleInput}
-        placeholder="Draft title (e.g. 96-02 Toyota 4Runner ABS pump)"
-        placeholderTextColor="#aaa"
-        value={draftTitle}
-        onChangeText={setDraftTitle}
-      />
-
       <View style={styles.buttonContainer}>
-        <View style={styles.button}>
+        <View style={styles.fetchButton}>
           <Button
             title={loading ? 'Loading...' : 'Fetch Listing Drafts'}
             onPress={fetchListingDrafts}
             disabled={loading}
           />
         </View>
-        <View style={styles.button}>
-          <Button
-            title={creatingDraft ? 'Creating...' : 'Create Sample Draft'}
-            onPress={createSampleDraft}
-            disabled={creatingDraft}
-            color="#4caf50"
-          />
-        </View>
+        <TouchableOpacity
+          onPress={() => setShowNewDraftForm(v => !v)}
+          style={[styles.newDraftButton, showNewDraftForm && styles.newDraftButtonActive]}
+        >
+          <Text style={[styles.newDraftButtonText, showNewDraftForm && styles.newDraftButtonTextActive]}>
+            {showNewDraftForm ? '✕ Cancel' : '+ New Draft'}
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={handleSignOut} style={styles.signOutButton}>
+          <Text style={styles.signOutText}>Sign out</Text>
+        </TouchableOpacity>
       </View>
 
-      {createMessage && (
-        <View style={styles.messageContainer}>
-          <Text style={styles.messageText}>{createMessage}</Text>
-        </View>
+      {showNewDraftForm && (
+        <NewDraftForm
+          onCreated={() => { setShowNewDraftForm(false); fetchListingDrafts(); }}
+          onCancel={() => setShowNewDraftForm(false)}
+        />
       )}
 
       {loading && <LoadingIndicator />}
       {error && <ErrorMessage message={error} />}
-      <DraftList drafts={drafts} />
+      <DraftList drafts={drafts} descTemplates={descTemplates} onTemplateAdded={handleTemplateAdded} onTemplateDeleted={handleTemplateDeleted} rateTables={rateTables} />
     </View>
   );
 }
@@ -130,34 +129,39 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f5',
     padding: 20,
   },
-  titleInput: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    fontSize: 14,
-    marginBottom: 10,
-    color: '#222',
-  },
   buttonContainer: {
     flexDirection: 'row',
+    alignItems: 'center',
     gap: 10,
     marginBottom: 10,
   },
-  button: {
+  fetchButton: {
     flex: 1,
   },
-  messageContainer: {
-    backgroundColor: '#e8f5e9',
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 10,
+  newDraftButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#1976d2',
   },
-  messageText: {
-    color: '#2e7d32',
-    textAlign: 'center',
-    fontSize: 14,
+  newDraftButtonActive: {
+    borderColor: '#bdbdbd',
+  },
+  newDraftButtonText: {
+    fontSize: 13,
+    color: '#1976d2',
+    fontWeight: '600',
+  },
+  newDraftButtonTextActive: {
+    color: '#999',
+  },
+  signOutButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  signOutText: {
+    fontSize: 13,
+    color: '#999',
   },
 });

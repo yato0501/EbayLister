@@ -92,6 +92,24 @@ export interface EbayOffer {
   imageUrls?: string[];
   aspects?: Record<string, string[]>;
   quantity?: number;
+  // Resolved return policy details
+  returnPolicy?: {
+    name?: string;
+    returnsAccepted?: boolean;
+    returnPeriod?: { value: number; unit: string };
+    returnShippingCostPayer?: string;
+  };
+  // Local scheduled date (datetime-local string, e.g. "2026-05-25T06:00")
+  scheduledDate?: string | null;
+  // Package dimensions & weight (from inventory item's packageWeightAndSize)
+  packageWeight?: number;
+  packageLength?: number;
+  packageWidth?: number;
+  packageHeight?: number;
+  // Flat rate shipping cost (USD string, stored locally)
+  shippingCost?: string;
+  // eBay rate table ID (stored locally; overrides per-service shippingCost when set)
+  rateTableId?: string;
 }
 
 export interface EbayOffersResponse {
