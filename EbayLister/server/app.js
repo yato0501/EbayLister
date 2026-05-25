@@ -64,7 +64,8 @@ async function loadTokens() {
     skuFulfillmentPolicies:  result.Item.skuFulfillmentPolicies  ? JSON.parse(result.Item.skuFulfillmentPolicies.S)  : {},
     skuShippingCosts:        result.Item.skuShippingCosts        ? JSON.parse(result.Item.skuShippingCosts.S)        : {},
     skuRateTables:           result.Item.skuRateTables           ? JSON.parse(result.Item.skuRateTables.S)           : {},
-  } : { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {} };
+    skuCategoryIds:          result.Item.skuCategoryIds          ? JSON.parse(result.Item.skuCategoryIds.S)          : {},
+  } : { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {}, skuCategoryIds: {} };
 
   return dynamoCache;
 }
@@ -88,6 +89,7 @@ async function saveTokens(tokens) {
       skuFulfillmentPolicies: { S: JSON.stringify(tokens.skuFulfillmentPolicies || {}) },
       skuShippingCosts:       { S: JSON.stringify(tokens.skuShippingCosts || {}) },
       skuRateTables:          { S: JSON.stringify(tokens.skuRateTables || {}) },
+      skuCategoryIds:         { S: JSON.stringify(tokens.skuCategoryIds || {}) },
       updatedAt:    { S: new Date().toISOString() },
     },
   }));
@@ -354,10 +356,12 @@ app.post('/auth/refresh', async (req, res) => {
 app.get('/api/listings', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try {
+    dynamoCache = null; // force fresh read so cross-request writes are always visible
     const stored = await loadTokens();
     const skuSchedules = stored.skuSchedules || {};
     const skuShippingCosts = stored.skuShippingCosts || {};
     const skuRateTables = stored.skuRateTables || {};
+    const skuCategoryIds = stored.skuCategoryIds || {};
     const token = await getUserAccessToken();
     const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
 
@@ -402,6 +406,7 @@ app.get('/api/listings', async (req, res) => {
       scheduledDate: skuSchedules[l.sku] || null,
       shippingCost: skuShippingCosts[l.sku] || null,
       rateTableId: skuRateTables[l.sku] || null,
+      categoryId: skuCategoryIds[l.sku] || null,
       offers: l.offers.map(o => ({
         ...o,
         returnPolicy: o.listingPolicies?.returnPolicyId ? (policyMap[o.listingPolicies.returnPolicyId] || null) : null,
@@ -442,25 +447,110 @@ const RETURN_POLICY_DEFS = {
 };
 
 // Build a PUT-safe offer body — eBay rejects empty strings for categoryId, listingDescription, etc.
+// Overrides are applied LAST so they always win over existing offerBody values.
 const buildCleanOfferBody = (offerBody, overrides = {}) => {
   const body = {
     sku:            offerBody.sku,
     marketplaceId:  'EBAY_US',
     format:         offerBody.format         || 'FIXED_PRICE',
     pricingSummary: offerBody.pricingSummary  || { price: { value: '0.00', currency: 'USD' } },
-    ...overrides,
   };
-  // Only include optional fields when they have valid non-empty values
-  if (offerBody.categoryId)           body.categoryId           = offerBody.categoryId;
-  if (offerBody.listingDescription)   body.listingDescription   = offerBody.listingDescription;
+  // Copy optional fields from existing offer (only when non-empty)
+  if (offerBody.categoryId)            body.categoryId            = offerBody.categoryId;
+  if (offerBody.listingDescription)    body.listingDescription    = offerBody.listingDescription;
   if (offerBody.quantityLimitPerBuyer) body.quantityLimitPerBuyer = offerBody.quantityLimitPerBuyer;
-  if (offerBody.merchantLocationKey)  body.merchantLocationKey  = offerBody.merchantLocationKey;
-  if (offerBody.tax)                  body.tax                  = offerBody.tax;
+  if (offerBody.merchantLocationKey)   body.merchantLocationKey   = offerBody.merchantLocationKey;
+  if (offerBody.tax)                   body.tax                   = offerBody.tax;
+  // Overrides take full precedence — applied last so they cannot be overwritten
+  Object.assign(body, overrides);
   return body;
 };
 
 let fulfillmentPolicyCacheId = null;
+let motorsFulfillmentPolicyCacheId = null;
+let motorsReturnPolicyCacheId = null;
 let merchantLocationKeyCached = null;
+
+// Returns true if categoryId belongs to tree 100 (EBAY_MOTORS_US) and not tree 0 (EBAY_US).
+// Uses get_category_subtree which reliably returns 400 for wrong-tree categories.
+async function isMotoorsCategory(categoryId) {
+  if (!categoryId) return false;
+  try {
+    const token = await getEbayMotorsToken();
+    await axios.get(
+      `https://api.ebay.com/commerce/taxonomy/v1/category_tree/0/get_category_subtree?category_id=${categoryId}`,
+      { headers: { 'Authorization': `Bearer ${token}` }, timeout: 8000 }
+    );
+    return false; // it IS in tree 0 → EBAY_US
+  } catch {
+    return true;  // not in tree 0 → treat as EBAY_MOTORS_US
+  }
+}
+
+const getOrCreateMotorsFulfillmentPolicy = async (token) => {
+  if (motorsFulfillmentPolicyCacheId) return motorsFulfillmentPolicyCacheId;
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+  const body = {
+    name: 'Motors Parts Shipping',
+    marketplaceId: 'EBAY_MOTORS_US',
+    categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+    handlingTime: { value: 3, unit: 'DAY' },
+    shipToLocations: { regionIncluded: [{ regionName: 'Worldwide', regionType: 'WORLDWIDE' }] },
+    shippingOptions: [{
+      optionType: 'DOMESTIC',
+      costType: 'FLAT_RATE',
+      shippingServices: [{
+        shippingCarrierCode: 'USPS',
+        shippingServiceCode: 'USPSPriority',
+        freeShipping: false,
+        shippingCost: { value: '5.00', currency: 'USD' },
+        additionalShippingCost: { value: '0.00', currency: 'USD' },
+      }],
+    }],
+  };
+  try {
+    const res = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_MOTORS_US`, { headers });
+    const existing = (res.data?.fulfillmentPolicies || []).find(p => p.name === 'Motors Parts Shipping');
+    if (existing) { motorsFulfillmentPolicyCacheId = existing.fulfillmentPolicyId; return motorsFulfillmentPolicyCacheId; }
+  } catch (e) { console.log('Could not list motors fulfillment policies:', e.message); }
+  try {
+    const created = await axios.post(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy`, body, { headers });
+    motorsFulfillmentPolicyCacheId = created.data?.fulfillmentPolicyId;
+  } catch (e) {
+    // If duplicate, eBay returns the existing policy ID — use it
+    const dupId = e.response?.data?.errors?.[0]?.parameters?.find(p => p.name === 'duplicatePolicyId')?.value;
+    if (dupId) { motorsFulfillmentPolicyCacheId = dupId; }
+    else throw e;
+  }
+  return motorsFulfillmentPolicyCacheId;
+};
+
+const getOrCreateMotorsReturnPolicy = async (token) => {
+  if (motorsReturnPolicyCacheId) return motorsReturnPolicyCacheId;
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+  const body = {
+    name: 'Motors Parts Returns',
+    marketplaceId: 'EBAY_MOTORS_US',
+    returnsAccepted: true,
+    returnPeriod: { value: 30, unit: 'DAY' },
+    returnShippingCostPayer: 'BUYER',
+    refundMethod: 'MONEY_BACK',
+  };
+  try {
+    const res = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/return_policy?marketplace_id=EBAY_MOTORS_US`, { headers });
+    const existing = (res.data?.returnPolicies || []).find(p => p.name === 'Motors Parts Returns');
+    if (existing) { motorsReturnPolicyCacheId = existing.returnPolicyId; return motorsReturnPolicyCacheId; }
+  } catch (e) { console.log('Could not list motors return policies:', e.message); }
+  try {
+    const created = await axios.post(`${EBAY_BASE_URL}/sell/account/v1/return_policy`, body, { headers });
+    motorsReturnPolicyCacheId = created.data?.returnPolicyId;
+  } catch (e) {
+    const dupId = e.response?.data?.errors?.[0]?.parameters?.find(p => p.name === 'duplicatePolicyId')?.value;
+    if (dupId) { motorsReturnPolicyCacheId = dupId; }
+    else throw e;
+  }
+  return motorsReturnPolicyCacheId;
+};
 
 const getOrCreateMerchantLocation = async (token) => {
   if (merchantLocationKeyCached) return merchantLocationKeyCached;
@@ -608,9 +698,16 @@ app.post('/api/listings', async (req, res) => {
 
 app.put('/api/listings/:sku', async (req, res) => {
   const { sku } = req.params;
-  const { title, condition, conditionDescription, description, quantity, aspects, returnPolicyChoice, scheduledDate, weight, length, width, height, shippingCost, rateTableId, categoryId } = req.body;
+  const { title, condition, conditionDescription, description, quantity, aspects, returnPolicyChoice, scheduledDate, weight, length, width, height, shippingCost, rateTableId, categoryId, price } = req.body;
 
   try {
+    // Persist categoryId to DynamoDB immediately — before any eBay API calls that could fail
+    if (categoryId) {
+      const s = await loadTokens();
+      const skuCategoryIds = { ...(s.skuCategoryIds || {}), [sku]: categoryId };
+      await saveTokens({ ...s, skuCategoryIds });
+    }
+
     const token = await getUserAccessToken();
     const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
 
@@ -650,7 +747,8 @@ app.put('/api/listings/:sku', async (req, res) => {
 
     await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item/${sku}`, updated, { headers });
 
-    // Apply return + fulfillment policies to all offers for this SKU
+    // Apply return + fulfillment policies to all offers for this SKU (includes categoryId)
+    let offerUpdateSucceeded = false;
     try {
       let fulfillmentPolicyId;
       const hasShipping = (shippingCost != null && shippingCost !== '') || (rateTableId != null && rateTableId !== '');
@@ -681,28 +779,56 @@ app.put('/api/listings/:sku', async (req, res) => {
           listingPolicies,
           merchantLocationKey: merchantLocationKey || offerBody.merchantLocationKey,
           ...(categoryId ? { categoryId } : {}),
+          ...(price ? { pricingSummary: { price: { value: price, currency: 'USD' } } } : {}),
         });
         if (offer.marketplaceId === 'EBAY_MOTORS_US') {
           console.log(`Fixing EBAY_MOTORS_US offer ${offerId} — deleting and recreating as EBAY_US`);
           await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, { headers });
           await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, cleanBody, { headers });
         } else {
-          await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
+          try {
+            await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
+          } catch (putErr) {
+            const errId = putErr.response?.data?.errors?.[0]?.errorId;
+            console.log(`Save PUT offer ${offerId} failed (${errId}):`, putErr.response?.data || putErr.message);
+            if (errId === 25713 || errId === 25001) {
+              await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, { headers }).catch(() => {});
+              await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, cleanBody, { headers });
+            } else {
+              throw putErr;
+            }
+          }
         }
       }));
+      offerUpdateSucceeded = true;
     } catch (e) {
       console.log('Policy update skipped:', e.response?.data || e.message);
     }
 
-    // Apply categoryId to offer — kept outside the silent catch above so failures surface to the user
-    if (categoryId) {
-      const catOffersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
-      const catOffers = catOffersRes.data?.offers || [];
-      await Promise.all(catOffers.map(async (offer) => {
-        const { offerId, status, listing, ...offerBody } = offer;
-        const cleanBody = buildCleanOfferBody(offerBody, { categoryId });
-        await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
-      }));
+    // Fallback: save categoryId if the offer update above failed for any reason
+    if (categoryId && !offerUpdateSucceeded) {
+      try {
+        const catOffersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
+        const catOffers = catOffersRes.data?.offers || [];
+        await Promise.all(catOffers.map(async (offer) => {
+          const { offerId, status, listing, ...offerBody } = offer;
+          const cleanBody = buildCleanOfferBody(offerBody, { categoryId });
+          try {
+            await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
+          } catch (e) {
+            const errId = e.response?.data?.errors?.[0]?.errorId;
+            if (errId === 25713 || errId === 25001) {
+              console.log(`Fallback: offer ${offerId} in bad state (${errId}), recreating`);
+              await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, { headers }).catch(() => {});
+              await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, cleanBody, { headers });
+            } else {
+              throw e;
+            }
+          }
+        }));
+      } catch (fallbackErr) {
+        console.log('CategoryId fallback failed:', fallbackErr.response?.data || fallbackErr.message);
+      }
     }
 
     // Store or clear scheduled date
@@ -788,7 +914,7 @@ app.get('/api/rate-tables', async (req, res) => {
 // Fetches the eBay Motors subtree (tree 0, category 6000) once per Lambda
 // lifecycle and does local text search — avoids eBay's broken suggestion API.
 
-let ebayMotorsCategoriesCache = null;
+let ebayMotorsCategoriesCache = null; // set to null to force re-fetch after Parts-only filter change
 
 async function getEbayMotorsToken() {
   const prodAuth = 'Basic ' + Buffer.from(
@@ -825,10 +951,21 @@ async function fetchEbayMotorsCategories() {
   }
   const root = r.data?.rootCategoryNode;
   if (root?.childCategoryTreeNodes) {
-    root.childCategoryTreeNodes.forEach(child => flatten(child, []));
+    // Only index Parts & Accessories — vehicle categories (Cars, Trucks, etc.) are EBAY_MOTORS_US only
+    // and will fail with error 25005 when used on an EBAY_US offer.
+    const partsNode = root.childCategoryTreeNodes.find(
+      c => c.category?.categoryName?.toLowerCase().includes('parts')
+    );
+    if (partsNode) {
+      console.log(`Tree 100 Parts node: "${partsNode.category.categoryName}" id=${partsNode.category.categoryId}`);
+      flatten(partsNode, []);
+    } else {
+      console.log('Tree 100: no "Parts" top-level node found — indexing all (fallback)');
+      root.childCategoryTreeNodes.forEach(child => flatten(child, []));
+    }
   }
   ebayMotorsCategoriesCache = categories;
-  console.log(`eBay Motors (tree 100) category cache: ${categories.length} leaf categories`);
+  console.log(`eBay Motors Parts (tree 100) category cache: ${categories.length} leaf categories`);
   return categories;
 }
 
@@ -838,16 +975,20 @@ app.get('/api/category-suggestions', async (req, res) => {
   try {
     const categories = await fetchEbayMotorsCategories();
     const ql = q.toLowerCase();
-    // Score: name match scores higher than path match
+    const words = ql.split(/\s+/).filter(Boolean);
     const scored = categories
       .map(c => {
-        const nameMatch = c.categoryName.toLowerCase().includes(ql);
-        const pathMatch = c.categoryPath.toLowerCase().includes(ql);
-        return { ...c, score: nameMatch ? 2 : pathMatch ? 1 : 0 };
+        const name = c.categoryName.toLowerCase();
+        const path = c.categoryPath.toLowerCase();
+        const phraseInName = name.includes(ql);
+        const phraseInPath = path.includes(ql);
+        const allWordsInPath = words.every(w => path.includes(w));
+        const score = phraseInName ? 4 : phraseInPath ? 3 : allWordsInPath ? 1 : 0;
+        return { ...c, score };
       })
       .filter(c => c.score > 0)
       .sort((a, b) => b.score - a.score)
-      .slice(0, 10)
+      .slice(0, 20)
       .map(({ score, ...c }) => c);
     res.json({ suggestions: scored });
   } catch (err) {
@@ -877,27 +1018,206 @@ app.delete('/api/description-templates/:name', async (req, res) => {
   res.json({ templates });
 });
 
+// ── Trading API (AddFixedPriceItem) for eBay Motors Parts ────────────────────
+
+const TRADING_API_URL = `${EBAY_BASE_URL}/ws/api.dll`;
+
+async function getSellerTradingProfiles(token) {
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+<GetSellerProfilesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <ErrorLanguage>en_US</ErrorLanguage>
+  <WarningLevel>High</WarningLevel>
+</GetSellerProfilesRequest>`;
+  const res = await axios.post(TRADING_API_URL, xml, {
+    headers: {
+      'X-EBAY-API-IAF-TOKEN': token,
+      'X-EBAY-API-CALL-NAME': 'GetSellerProfiles',
+      'X-EBAY-API-SITEID': '100',
+      'X-EBAY-API-COMPATIBILITY-LEVEL': '1193',
+      'X-EBAY-API-APP-NAME': process.env.EBAY_PRODUCTION_CLIENT_ID,
+      'Content-Type': 'text/xml',
+    },
+  });
+  const out = res.data;
+  console.log('GetSellerProfiles response:', out.substring(0, 500));
+  return {
+    shippingId: (out.match(/<ShippingProfileID>(\d+)<\/ShippingProfileID>/) || [])[1],
+    returnId:   (out.match(/<ReturnProfileID>(\d+)<\/ReturnProfileID>/)    || [])[1],
+    paymentId:  (out.match(/<PaymentProfileID>(\d+)<\/PaymentProfileID>/)  || [])[1],
+  };
+}
+
+const CONDITION_TO_TRADING_ID = {
+  NEW: 1000, LIKE_NEW: 1500,
+  USED_EXCELLENT: 1500, USED_VERY_GOOD: 2500,
+  USED_GOOD: 3000, USED_ACCEPTABLE: 4000,
+  FOR_PARTS_OR_NOT_WORKING: 7000,
+};
+
+function escapeXml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function publishViaTrading(sku, categoryId, token, priceOverride) {
+  const invHeaders = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+  const [itemRes, offersRes, storedRes] = await Promise.allSettled([
+    axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers: invHeaders }),
+    axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: invHeaders }),
+    loadTokens(),
+  ]);
+  if (itemRes.status === 'rejected') throw itemRes.reason; // inventory item is required
+  const item  = itemRes.value.data;
+  const offer = offersRes.status === 'fulfilled' ? (offersRes.value.data?.offers?.[0] || {}) : {};
+  const stored = storedRes.status === 'fulfilled' ? storedRes.value : {};
+
+  const title       = escapeXml((item.product?.title || sku).substring(0, 80));
+  const description = item.product?.description || offer.listingDescription || item.product?.title || sku;
+  const conditionId = CONDITION_TO_TRADING_ID[item.condition] || 3000;
+  const price       = priceOverride || offer.pricingSummary?.price?.value || '0.00';
+  const quantity    = item.availability?.shipToLocationAvailability?.quantity || 1;
+  const images      = (item.product?.imageUrls || []).slice(0, 12);
+
+  // Fetch seller's business profiles — required when seller is opted into business policies
+  const profiles = await getSellerTradingProfiles(token).catch(e => {
+    console.warn('GetSellerProfiles failed, will use legacy fields:', e.message);
+    return {};
+  });
+  console.log(`Trading profiles: shipping=${profiles.shippingId} return=${profiles.returnId} payment=${profiles.paymentId}`);
+
+  const pictureXml = images.map(u => `      <PictureURL>${escapeXml(u)}</PictureURL>`).join('\n');
+
+  // Item specifics from product aspects (Brand, Placement, etc.)
+  const aspects = item.product?.aspects || {};
+  const itemSpecificsXml = Object.entries(aspects)
+    .map(([name, values]) => `    <NameValueList><Name>${escapeXml(name)}</Name>${(Array.isArray(values) ? values : [values]).map(v => `<Value>${escapeXml(String(v))}</Value>`).join('')}</NameValueList>`)
+    .join('\n');
+
+  // Use SellerProfiles (business policies) if we have IDs, otherwise fall back to legacy fields
+  const shippingXml = profiles.shippingId
+    ? `<SellerProfiles>
+    ${profiles.shippingId ? `<SellerShippingProfile><ShippingProfileID>${profiles.shippingId}</ShippingProfileID></SellerShippingProfile>` : ''}
+    ${profiles.returnId   ? `<SellerReturnProfile><ReturnProfileID>${profiles.returnId}</ReturnProfileID></SellerReturnProfile>` : ''}
+    ${profiles.paymentId  ? `<SellerPaymentProfile><PaymentProfileID>${profiles.paymentId}</PaymentProfileID></SellerPaymentProfile>` : ''}
+  </SellerProfiles>`
+    : `<ShippingDetails>
+    <ShippingType>Flat</ShippingType>
+    <ShippingServiceOptions>
+      <ShippingServicePriority>1</ShippingServicePriority>
+      <ShippingService>USPSPriority</ShippingService>
+      <ShippingServiceCost>${(stored?.skuShippingCosts || {})[sku] || '5.00'}</ShippingServiceCost>
+    </ShippingServiceOptions>
+  </ShippingDetails>
+  <ReturnPolicy>
+    <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
+    <ReturnsWithinOption>Days_30</ReturnsWithinOption>
+    <ShippingCostPaidByOption>Buyer</ShippingCostPaidByOption>
+    <RefundOption>MoneyBack</RefundOption>
+  </ReturnPolicy>`;
+
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+<AddFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <Item>
+    <Title>${title}</Title>
+    <Description><![CDATA[${description}]]></Description>
+    <PrimaryCategory><CategoryID>${categoryId}</CategoryID></PrimaryCategory>
+    <StartPrice>${price}</StartPrice>
+    <Quantity>${quantity}</Quantity>
+    <ListingType>FixedPriceItem</ListingType>
+    <ListingDuration>GTC</ListingDuration>
+    <ConditionID>${conditionId}</ConditionID>
+    <Country>US</Country>
+    <Currency>USD</Currency>
+    <Location>United States</Location>
+    <DispatchTimeMax>3</DispatchTimeMax>
+    ${pictureXml ? `<PictureDetails>\n${pictureXml}\n    </PictureDetails>` : ''}
+    ${itemSpecificsXml ? `<ItemSpecifics>\n${itemSpecificsXml}\n  </ItemSpecifics>` : ''}
+    ${shippingXml}
+  </Item>
+  <ErrorLanguage>en_US</ErrorLanguage>
+  <WarningLevel>High</WarningLevel>
+</AddFixedPriceItemRequest>`;
+
+  console.log('Trading API XML (first 800 chars):', xml.substring(0, 800));
+
+  const tradingRes = await axios.post(TRADING_API_URL, xml, {
+    headers: {
+      'X-EBAY-API-IAF-TOKEN': token,
+      'X-EBAY-API-CALL-NAME': 'AddFixedPriceItem',
+      'X-EBAY-API-SITEID': '100',
+      'X-EBAY-API-COMPATIBILITY-LEVEL': '1193',
+      'X-EBAY-API-APP-NAME': process.env.EBAY_PRODUCTION_CLIENT_ID,
+      'Content-Type': 'text/xml',
+    },
+  });
+
+  const xml_out  = tradingRes.data;
+  const ack      = (xml_out.match(/<Ack>(.*?)<\/Ack>/) || [])[1];
+  const itemId   = (xml_out.match(/<ItemID>(\d+)<\/ItemID>/) || [])[1];
+  const errMsgs  = [...xml_out.matchAll(/<ShortMessage>(.*?)<\/ShortMessage>/g)].map(m => m[1]);
+  const longMsgs = [...xml_out.matchAll(/<LongMessage>(.*?)<\/LongMessage>/g)].map(m => m[1]);
+
+  console.log(`Trading API AddFixedPriceItem: ack=${ack} itemId=${itemId}`, longMsgs.length ? longMsgs : errMsgs);
+
+  if (ack === 'Success' || ack === 'Warning') {
+    return { listingId: itemId, warnings: longMsgs.length ? longMsgs : errMsgs };
+  }
+  // Return long messages (more detailed) deduplicated against short messages
+  const tradingErrors = longMsgs.length > 0 ? longMsgs : errMsgs;
+  throw Object.assign(new Error(tradingErrors[0] || 'Trading API error'), { tradingErrors });
+}
+
 app.post('/api/publish-listing', async (req, res) => {
-  const { sku, categoryId } = req.body;
+  const { sku, categoryId, price } = req.body;
   if (!sku) return res.status(400).json({ error: 'sku required' });
 
   try {
     const token = await getUserAccessToken();
     const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
 
+    // Check DynamoDB FIRST — before any eBay API calls that could fail on a broken offer.
+    // If a stored categoryId exists, eBay stripped a Motors category from the offer (tree 100),
+    // which means the offer may be in a broken state returning 25713 on GET/PUT/publish.
+    // Skip the offer fetch entirely and go straight to Trading API.
+    dynamoCache = null;
+    const storedData = await loadTokens();
+    const storedCategoryId = (storedData.skuCategoryIds || {})[sku];
+
+    const useMotors = storedCategoryId
+      ? true
+      : (categoryId ? await isMotoorsCategory(categoryId) : false);
+    console.log(`Publish: sku=${sku} storedCategory=${storedCategoryId} reqCategory=${categoryId} useMotors=${useMotors}`);
+
+    if (useMotors) {
+      const effectiveCategoryId = categoryId || storedCategoryId;
+      const result = await publishViaTrading(sku, effectiveCategoryId, token, price);
+      return res.json({
+        success: true,
+        listings: [{ listingId: result.listingId }],
+        errors: result.warnings.map(w => ({ message: w })),
+      });
+    }
+
+    // Sell Inventory path — now safe to fetch offers
     const offersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
     const offers = offersRes.data?.offers || [];
     if (offers.length === 0) return res.status(404).json({ success: false, errors: [{ message: 'No offers found for this SKU' }] });
 
-    // Ensure fulfillment + return policy + merchant location are set (all required by eBay before publish)
+    const effectiveCategoryId = categoryId || offers[0]?.categoryId || storedCategoryId;
+    console.log(`Publish (Sell Inventory): offerCategory=${offers[0]?.categoryId} effective=${effectiveCategoryId}`);
+
     const [fulfillmentPolicyId, returnPolicyId, merchantLocationKey] = await Promise.all([
       getOrCreateFulfillmentPolicy(token),
       getOrCreateReturnPolicy(token, 'BUYER_PAYS_30'),
       getOrCreateMerchantLocation(token),
     ]);
-    let hadMotorsOffer = false;
+    const targetMarketplace = 'EBAY_US';
+
+    let needsRefetch = false;
     await Promise.all(offers.map(async (offer) => {
       const { offerId, status, listing, ...offerBody } = offer;
+      console.log(`Publish pre-update: offerId=${offerId} status=${status} marketplace=${offer.marketplaceId}`);
       const listingPolicies = {
         ...(offerBody.listingPolicies || {}),
         ...(fulfillmentPolicyId ? { fulfillmentPolicyId } : {}),
@@ -908,21 +1228,40 @@ app.post('/api/publish-listing', async (req, res) => {
         merchantLocationKey: merchantLocationKey || offerBody.merchantLocationKey,
         ...(categoryId ? { categoryId } : {}),
       });
-      if (offer.marketplaceId === 'EBAY_MOTORS_US') {
-        hadMotorsOffer = true;
-        console.log(`Fixing EBAY_MOTORS_US offer ${offerId} — deleting and recreating as EBAY_US`);
+      // If the offer's marketplace doesn't match what we need, OR it's in a broken state,
+      // delete and recreate so we have a clean UNPUBLISHED offer to publish
+      const needsRecreate = offer.marketplaceId !== targetMarketplace;
+      if (needsRecreate) {
+        needsRefetch = true;
+        console.log(`Recreating offer ${offerId} as ${targetMarketplace} (was ${offer.marketplaceId})`);
         await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, { headers });
-        await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, cleanBody, { headers });
+        const newBody = { ...cleanBody, marketplaceId: targetMarketplace };
+        await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, newBody, { headers });
       } else {
-        await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
+        try {
+          await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
+        } catch (putErr) {
+          const putErrId = putErr.response?.data?.errors?.[0]?.errorId;
+          console.log(`PUT offer ${offerId} failed (${putErrId}): ${JSON.stringify(putErr.response?.data)}`);
+          // Offer is in an unrecoverable state — delete and recreate fresh
+          if (putErrId === 25713 || putErrId === 25001) {
+            needsRefetch = true;
+            console.log(`Recreating broken offer ${offerId}`);
+            await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, { headers }).catch(() => {});
+            await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, cleanBody, { headers });
+          } else {
+            throw putErr;
+          }
+        }
       }
     }));
 
-    // Re-fetch offers so we have the correct offerId(s) after any delete+recreate
-    const publishOffers = hadMotorsOffer
+    // Always re-fetch offers before publish to guarantee we have the latest offerIds
+    const publishOffers = needsRefetch
       ? (await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers })).data?.offers || []
       : offers;
 
+    console.log(`Publishing ${publishOffers.length} offer(s):`, publishOffers.map(o => `${o.offerId}(${o.status})`));
     const results = await Promise.allSettled(
       publishOffers.map(offer =>
         axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offer.offerId}/publish`, {}, { headers })
@@ -938,16 +1277,59 @@ app.post('/api/publish-listing', async (req, res) => {
 
     if (successes.length > 0) {
       res.json({ success: true, listings: successes, errors: failures });
+    } else if (failures.some(e => e.errorId === 25713) && effectiveCategoryId) {
+      // Offer is unavailable for Sell Inventory publish — fall back to Trading API
+      console.log(`Sell Inventory publish failed with 25713, falling back to Trading API for category ${effectiveCategoryId}`);
+      const tradingResult = await publishViaTrading(sku, effectiveCategoryId, token, price);
+      res.json({ success: true, listings: [{ listingId: tradingResult.listingId }], errors: tradingResult.warnings.map(w => ({ message: w })) });
     } else {
       res.status(400).json({ success: false, errors: failures });
     }
   } catch (err) {
+    if (err.tradingErrors) {
+      return res.status(400).json({ success: false, errors: err.tradingErrors.map(m => ({ message: m })) });
+    }
     const errs = err.response?.data?.errors;
     res.status(err.response?.status || 500).json({
       success: false,
       errors: errs || [{ message: err.message }],
     });
   }
+});
+
+// Returns the top-level category names+IDs of tree 0 (EBAY_US) so we can see if eBay Motors is there
+app.get('/api/tree0-toplevel', async (req, res) => {
+  try {
+    const token = await getEbayMotorsToken();
+    const r = await axios.get('https://api.ebay.com/commerce/taxonomy/v1/category_tree/0', {
+      headers: { 'Authorization': `Bearer ${token}` }, timeout: 30000,
+    });
+    const topLevel = (r.data?.rootCategoryNode?.childCategoryTreeNodes || [])
+      .map(n => ({ id: n.category?.categoryId, name: n.category?.categoryName, childCount: n.childCategoryTreeNodes?.length || 0 }));
+    res.json({ topLevel });
+  } catch (err) {
+    res.status(err.response?.status || 500).json(err.response?.data || { message: err.message });
+  }
+});
+
+// Check if a specific category ID exists in tree 0 and/or tree 100
+app.get('/api/category-check/:id', async (req, res) => {
+  const { id } = req.params;
+  const token = await getEbayMotorsToken();
+  const headers = { 'Authorization': `Bearer ${token}` };
+  const check = async (treeId) => {
+    try {
+      const r = await axios.get(
+        `https://api.ebay.com/commerce/taxonomy/v1/category_tree/${treeId}/get_category_subtree?category_id=${id}`,
+        { headers, timeout: 10000 }
+      );
+      return { exists: true, name: r.data?.categorySubtreeNode?.category?.categoryName };
+    } catch (e) {
+      return { exists: false, error: e.response?.data?.errors?.[0]?.message || e.message };
+    }
+  };
+  const [tree0, tree100] = await Promise.all([check(0), check(100)]);
+  res.json({ categoryId: id, tree0, tree100 });
 });
 
 app.post('/api/enhance-listing', async (req, res) => {
@@ -1029,6 +1411,21 @@ app.get('/api/offer-debug/:sku', async (req, res) => {
     res.json(offersRes.data);
   } catch (err) {
     res.status(err.response?.status || 500).json(err.response?.data || { message: err.message });
+  }
+});
+
+app.get('/api/debug/stored', async (req, res) => {
+  try {
+    dynamoCache = null; // force fresh read
+    const stored = await loadTokens();
+    res.json({
+      skuCategoryIds: stored.skuCategoryIds || {},
+      skuShippingCosts: stored.skuShippingCosts || {},
+      skuRateTables: stored.skuRateTables || {},
+      skus: stored.skus || [],
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

@@ -373,6 +373,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
 
   const [editData, setEditData] = useState({
     title:                draft.title                || '',
+    price:                draft.pricingSummary?.price?.value || '',
     condition:            draft.condition            || 'USED_GOOD',
     conditionDescription: draft.conditionDescription || '',
     returnPolicyChoice:   initialReturnPolicyChoice,
@@ -438,7 +439,11 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
       const res = await fetch(`${BACKEND_URL}/api/publish-listing`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sku: draft.sku, categoryId: editData.categoryId || undefined }),
+        body: JSON.stringify({
+          sku: draft.sku,
+          categoryId: editData.categoryId || undefined,
+          price: editData.price || undefined,
+        }),
       });
       const data = await res.json();
       if (data.success) {
@@ -498,6 +503,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
           shippingCost: editData.shippingCost || undefined,
           rateTableId: editData.rateTableId || undefined,
           categoryId: editData.categoryId || undefined,
+          price: editData.price || undefined,
         }),
       });
       const data = await res.json();
@@ -600,6 +606,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
           <ConditionPicker value={editData.condition} onChange={setField('condition')} />
           <EditField label="CONDITION NOTES" value={editData.conditionDescription} onChangeText={setField('conditionDescription')} />
           <EditField label="QUANTITY" value={editData.quantity} onChangeText={setField('quantity')} />
+          <EditField label="PRICE (USD)" value={editData.price} onChangeText={setField('price')} />
 
           {/* Shipping */}
           <View style={styles.shippingBlock}>
