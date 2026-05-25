@@ -96,6 +96,7 @@ async function saveTokens(tokens) {
 // ── eBay OAuth helpers ────────────────────────────────────────────────────────
 
 const SCOPES = [
+  'https://api.ebay.com/oauth/api_scope',
   'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
   'https://api.ebay.com/oauth/api_scope/sell.account',
@@ -195,13 +196,13 @@ async function getOrUpdateSkuFulfillmentPolicy(token, sku, shippingCost, rateTab
   const stored = await loadTokens();
   const existingId = (stored.skuFulfillmentPolicies || {})[sku];
 
-  // Build the shipping service — omit shippingCost when a rate table is used (table provides pricing)
+  // Flat rate = lower 48 base cost; rate table = regional overrides (AK/HI, international) — both coexist
   const shippingService = {
     shippingCarrierCode: 'USPS',
     shippingServiceCode: 'USPSPriority',
     freeShipping: false,
     additionalShippingCost: { value: '0.00', currency: 'USD' },
-    ...(!rateTableId && shippingCost ? { shippingCost: { value: parseFloat(shippingCost).toFixed(2), currency: 'USD' } } : {}),
+    ...(shippingCost ? { shippingCost: { value: parseFloat(shippingCost).toFixed(2), currency: 'USD' } } : {}),
   };
 
   const shippingOption = {
@@ -216,6 +217,7 @@ async function getOrUpdateSkuFulfillmentPolicy(token, sku, shippingCost, rateTab
     marketplaceId: 'EBAY_US',
     categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
     handlingTime: { value: 3, unit: 'DAY' },
+    shipToLocations: { regionIncluded: [{ regionName: 'Worldwide', regionType: 'WORLDWIDE' }] },
     shippingOptions: [shippingOption],
   };
 
@@ -439,30 +441,70 @@ const RETURN_POLICY_DEFS = {
   },
 };
 
+// Build a PUT-safe offer body — eBay rejects empty strings for categoryId, listingDescription, etc.
+const buildCleanOfferBody = (offerBody, overrides = {}) => {
+  const body = {
+    sku:            offerBody.sku,
+    marketplaceId:  'EBAY_US',
+    format:         offerBody.format         || 'FIXED_PRICE',
+    pricingSummary: offerBody.pricingSummary  || { price: { value: '0.00', currency: 'USD' } },
+    ...overrides,
+  };
+  // Only include optional fields when they have valid non-empty values
+  if (offerBody.categoryId)           body.categoryId           = offerBody.categoryId;
+  if (offerBody.listingDescription)   body.listingDescription   = offerBody.listingDescription;
+  if (offerBody.quantityLimitPerBuyer) body.quantityLimitPerBuyer = offerBody.quantityLimitPerBuyer;
+  if (offerBody.merchantLocationKey)  body.merchantLocationKey  = offerBody.merchantLocationKey;
+  if (offerBody.tax)                  body.tax                  = offerBody.tax;
+  return body;
+};
+
 let fulfillmentPolicyCacheId = null;
+let merchantLocationKeyCached = null;
+
+const getOrCreateMerchantLocation = async (token) => {
+  if (merchantLocationKeyCached) return merchantLocationKeyCached;
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+  const key = 'ebaylister-us';
+
+  try {
+    // Try to GET existing location first
+    await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/location/${key}`, { headers });
+    merchantLocationKeyCached = key;
+    return key;
+  } catch (e) {
+    if (e.response?.status !== 404) {
+      console.log('Could not fetch merchant location:', e.response?.data || e.message);
+    }
+  }
+
+  // Create it — eBay requires at least country + postalCode for US locations
+  try {
+    await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/location/${key}`, {
+      location: { address: { country: 'US', postalCode: '10001' } },
+      locationTypes: ['WAREHOUSE'],
+      name: 'Default US Location',
+      merchantLocationStatus: 'ENABLED',
+    }, { headers });
+    merchantLocationKeyCached = key;
+    return key;
+  } catch (e) {
+    console.log('Could not create merchant location:', e.response?.data || e.message);
+    return null;
+  }
+};
 
 const getOrCreateFulfillmentPolicy = async (token) => {
   if (fulfillmentPolicyCacheId) return fulfillmentPolicyCacheId;
 
   const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
 
-  try {
-    const res = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers });
-    const existing = (res.data?.fulfillmentPolicies || [])[0];
-    if (existing) {
-      fulfillmentPolicyCacheId = existing.fulfillmentPolicyId;
-      return fulfillmentPolicyCacheId;
-    }
-  } catch (e) {
-    console.log('Could not list fulfillment policies:', e.message);
-  }
-
-  // Create a minimal flat-rate domestic shipping policy
-  const created = await axios.post(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy`, {
+  const defaultPolicyBody = {
     name: 'Default Shipping',
     marketplaceId: 'EBAY_US',
     categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
     handlingTime: { value: 3, unit: 'DAY' },
+    shipToLocations: { regionIncluded: [{ regionName: 'Worldwide', regionType: 'WORLDWIDE' }] },
     shippingOptions: [{
       optionType: 'DOMESTIC',
       costType: 'FLAT_RATE',
@@ -474,7 +516,27 @@ const getOrCreateFulfillmentPolicy = async (token) => {
         additionalShippingCost: { value: '0.00', currency: 'USD' },
       }],
     }],
-  }, { headers });
+  };
+
+  try {
+    const res = await axios.get(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US`, { headers });
+    const existing = (res.data?.fulfillmentPolicies || [])[0];
+    if (existing) {
+      // Always PUT-update to ensure shipToLocations is present
+      try {
+        await axios.put(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy/${existing.fulfillmentPolicyId}`, defaultPolicyBody, { headers });
+      } catch (e) {
+        console.log('Could not update existing fulfillment policy:', e.response?.data || e.message);
+      }
+      fulfillmentPolicyCacheId = existing.fulfillmentPolicyId;
+      return fulfillmentPolicyCacheId;
+    }
+  } catch (e) {
+    console.log('Could not list fulfillment policies:', e.message);
+  }
+
+  // Create a minimal flat-rate domestic shipping policy
+  const created = await axios.post(`${EBAY_BASE_URL}/sell/account/v1/fulfillment_policy`, defaultPolicyBody, { headers });
 
   fulfillmentPolicyCacheId = created.data?.fulfillmentPolicyId;
   return fulfillmentPolicyCacheId;
@@ -546,7 +608,7 @@ app.post('/api/listings', async (req, res) => {
 
 app.put('/api/listings/:sku', async (req, res) => {
   const { sku } = req.params;
-  const { title, condition, conditionDescription, description, quantity, aspects, returnPolicyChoice, scheduledDate, weight, length, width, height, shippingCost, rateTableId } = req.body;
+  const { title, condition, conditionDescription, description, quantity, aspects, returnPolicyChoice, scheduledDate, weight, length, width, height, shippingCost, rateTableId, categoryId } = req.body;
 
   try {
     const token = await getUserAccessToken();
@@ -607,20 +669,40 @@ app.put('/api/listings/:sku', async (req, res) => {
       const returnPolicyId = await getOrCreateReturnPolicy(token, returnPolicyChoice || 'BUYER_PAYS_30');
       const offersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
       const offers = offersRes.data?.offers || [];
+      const merchantLocationKey = await getOrCreateMerchantLocation(token);
       await Promise.all(offers.map(async (offer) => {
         const { offerId, status, listing, ...offerBody } = offer;
-        const updatedOffer = {
-          ...offerBody,
-          listingPolicies: {
-            ...offerBody.listingPolicies,
-            ...(returnPolicyId    ? { returnPolicyId }    : {}),
-            ...(fulfillmentPolicyId ? { fulfillmentPolicyId } : {}),
-          },
+        const listingPolicies = {
+          ...(offerBody.listingPolicies || {}),
+          ...(returnPolicyId     ? { returnPolicyId }     : {}),
+          ...(fulfillmentPolicyId ? { fulfillmentPolicyId } : {}),
         };
-        await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, updatedOffer, { headers });
+        const cleanBody = buildCleanOfferBody(offerBody, {
+          listingPolicies,
+          merchantLocationKey: merchantLocationKey || offerBody.merchantLocationKey,
+          ...(categoryId ? { categoryId } : {}),
+        });
+        if (offer.marketplaceId === 'EBAY_MOTORS_US') {
+          console.log(`Fixing EBAY_MOTORS_US offer ${offerId} — deleting and recreating as EBAY_US`);
+          await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, { headers });
+          await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, cleanBody, { headers });
+        } else {
+          await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
+        }
       }));
     } catch (e) {
       console.log('Policy update skipped:', e.response?.data || e.message);
+    }
+
+    // Apply categoryId to offer — kept outside the silent catch above so failures surface to the user
+    if (categoryId) {
+      const catOffersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
+      const catOffers = catOffersRes.data?.offers || [];
+      await Promise.all(catOffers.map(async (offer) => {
+        const { offerId, status, listing, ...offerBody } = offer;
+        const cleanBody = buildCleanOfferBody(offerBody, { categoryId });
+        await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
+      }));
     }
 
     // Store or clear scheduled date
@@ -702,6 +784,78 @@ app.get('/api/rate-tables', async (req, res) => {
   }
 });
 
+// ── eBay Motors category cache ────────────────────────────────────────────────
+// Fetches the eBay Motors subtree (tree 0, category 6000) once per Lambda
+// lifecycle and does local text search — avoids eBay's broken suggestion API.
+
+let ebayMotorsCategoriesCache = null;
+
+async function getEbayMotorsToken() {
+  const prodAuth = 'Basic ' + Buffer.from(
+    `${process.env.EBAY_PRODUCTION_CLIENT_ID}:${process.env.EBAY_PRODUCTION_CLIENT_SECRET}`
+  ).toString('base64');
+  const tokenRes = await axios.post(
+    'https://api.ebay.com/identity/v1/oauth2/token',
+    `grant_type=client_credentials&scope=${encodeURIComponent('https://api.ebay.com/oauth/api_scope')}`,
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': prodAuth } }
+  );
+  return tokenRes.data.access_token;
+}
+
+async function fetchEbayMotorsCategories() {
+  if (ebayMotorsCategoriesCache) return ebayMotorsCategoriesCache;
+  const token = await getEbayMotorsToken();
+  // Tree 100 = EBAY_MOTORS_US — fetch the full subtree from the root
+  const r = await axios.get(
+    'https://api.ebay.com/commerce/taxonomy/v1/category_tree/100',
+    { headers: { 'Authorization': `Bearer ${token}` }, timeout: 30000 }
+  );
+  const categories = [];
+  function flatten(node, pathParts) {
+    const name = node.category?.categoryName;
+    const id   = node.category?.categoryId;
+    if (!name || !id) return;
+    const currentPath = [...pathParts, name];
+    const children = node.childCategoryTreeNodes;
+    if (!children || children.length === 0) {
+      categories.push({ categoryId: id, categoryName: name, categoryPath: currentPath.join(' > ') });
+    } else {
+      children.forEach(child => flatten(child, currentPath));
+    }
+  }
+  const root = r.data?.rootCategoryNode;
+  if (root?.childCategoryTreeNodes) {
+    root.childCategoryTreeNodes.forEach(child => flatten(child, []));
+  }
+  ebayMotorsCategoriesCache = categories;
+  console.log(`eBay Motors (tree 100) category cache: ${categories.length} leaf categories`);
+  return categories;
+}
+
+app.get('/api/category-suggestions', async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.length < 2) return res.json({ suggestions: [] });
+  try {
+    const categories = await fetchEbayMotorsCategories();
+    const ql = q.toLowerCase();
+    // Score: name match scores higher than path match
+    const scored = categories
+      .map(c => {
+        const nameMatch = c.categoryName.toLowerCase().includes(ql);
+        const pathMatch = c.categoryPath.toLowerCase().includes(ql);
+        return { ...c, score: nameMatch ? 2 : pathMatch ? 1 : 0 };
+      })
+      .filter(c => c.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10)
+      .map(({ score, ...c }) => c);
+    res.json({ suggestions: scored });
+  } catch (err) {
+    console.error('Category suggestions error:', err.response?.data || err.message);
+    res.status(500).json({ suggestions: [], error: err.response?.data || err.message });
+  }
+});
+
 app.get('/api/description-templates', async (req, res) => {
   const stored = await loadTokens();
   res.json({ templates: stored.descTemplates || [] });
@@ -724,7 +878,7 @@ app.delete('/api/description-templates/:name', async (req, res) => {
 });
 
 app.post('/api/publish-listing', async (req, res) => {
-  const { sku } = req.body;
+  const { sku, categoryId } = req.body;
   if (!sku) return res.status(400).json({ error: 'sku required' });
 
   try {
@@ -735,26 +889,42 @@ app.post('/api/publish-listing', async (req, res) => {
     const offers = offersRes.data?.offers || [];
     if (offers.length === 0) return res.status(404).json({ success: false, errors: [{ message: 'No offers found for this SKU' }] });
 
-    // Ensure fulfillment policy is attached (required for eBay to know item country)
-    try {
-      const fulfillmentPolicyId = await getOrCreateFulfillmentPolicy(token);
-      if (fulfillmentPolicyId) {
-        await Promise.all(offers.map(async (offer) => {
-          if (!offer.listingPolicies?.fulfillmentPolicyId) {
-            const { offerId, status, listing, ...offerBody } = offer;
-            await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, {
-              ...offerBody,
-              listingPolicies: { ...offerBody.listingPolicies, fulfillmentPolicyId },
-            }, { headers });
-          }
-        }));
+    // Ensure fulfillment + return policy + merchant location are set (all required by eBay before publish)
+    const [fulfillmentPolicyId, returnPolicyId, merchantLocationKey] = await Promise.all([
+      getOrCreateFulfillmentPolicy(token),
+      getOrCreateReturnPolicy(token, 'BUYER_PAYS_30'),
+      getOrCreateMerchantLocation(token),
+    ]);
+    let hadMotorsOffer = false;
+    await Promise.all(offers.map(async (offer) => {
+      const { offerId, status, listing, ...offerBody } = offer;
+      const listingPolicies = {
+        ...(offerBody.listingPolicies || {}),
+        ...(fulfillmentPolicyId ? { fulfillmentPolicyId } : {}),
+        ...(returnPolicyId     ? { returnPolicyId }     : {}),
+      };
+      const cleanBody = buildCleanOfferBody(offerBody, {
+        listingPolicies,
+        merchantLocationKey: merchantLocationKey || offerBody.merchantLocationKey,
+        ...(categoryId ? { categoryId } : {}),
+      });
+      if (offer.marketplaceId === 'EBAY_MOTORS_US') {
+        hadMotorsOffer = true;
+        console.log(`Fixing EBAY_MOTORS_US offer ${offerId} — deleting and recreating as EBAY_US`);
+        await axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, { headers });
+        await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, cleanBody, { headers });
+      } else {
+        await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
       }
-    } catch (e) {
-      console.log('Fulfillment policy pre-publish attach skipped:', e.response?.data || e.message);
-    }
+    }));
+
+    // Re-fetch offers so we have the correct offerId(s) after any delete+recreate
+    const publishOffers = hadMotorsOffer
+      ? (await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers })).data?.offers || []
+      : offers;
 
     const results = await Promise.allSettled(
-      offers.map(offer =>
+      publishOffers.map(offer =>
         axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offer.offerId}/publish`, {}, { headers })
           .then(r => ({ offerId: offer.offerId, listingId: r.data.listingId }))
       )
@@ -813,6 +983,52 @@ app.post('/api/enhance-listing', async (req, res) => {
   } catch (err) {
     console.error('Enhance listing error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Force-repair a broken offer (e.g. stuck EBAY_MOTORS_US): delete all offers for SKU and create a fresh EBAY_US one
+app.post('/api/fix-offer/:sku', async (req, res) => {
+  const { sku } = req.params;
+  try {
+    const token = await getUserAccessToken();
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+
+    // Try to delete any existing offers — ignore errors (may not be retrievable)
+    try {
+      const offersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers });
+      const offers = offersRes.data?.offers || [];
+      await Promise.all(offers.map(o => axios.delete(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${o.offerId}`, { headers }).catch(() => {})));
+      console.log(`fix-offer: deleted ${offers.length} existing offer(s) for ${sku}`);
+    } catch (e) {
+      console.log(`fix-offer: GET offers failed (${e.response?.data?.errors?.[0]?.errorId}) — continuing`);
+    }
+
+    // Create a fresh EBAY_US offer
+    const fulfillmentPolicyId = await getOrCreateFulfillmentPolicy(token);
+    const merchantLocationKey = await getOrCreateMerchantLocation(token);
+    const createRes = await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, {
+      sku,
+      marketplaceId: 'EBAY_US',
+      format: 'FIXED_PRICE',
+      pricingSummary: { price: { value: '0.01', currency: 'USD' } },
+      listingPolicies: { fulfillmentPolicyId },
+      merchantLocationKey,
+    }, { headers });
+    res.json({ success: true, offerId: createRes.data.offerId });
+  } catch (err) {
+    console.error('fix-offer error:', err.response?.data || err.message);
+    res.status(err.response?.status || 500).json(err.response?.data || { message: err.message });
+  }
+});
+
+app.get('/api/offer-debug/:sku', async (req, res) => {
+  try {
+    const token = await getUserAccessToken();
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+    const offersRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/offer?sku=${encodeURIComponent(req.params.sku)}`, { headers });
+    res.json(offersRes.data);
+  } catch (err) {
+    res.status(err.response?.status || 500).json(err.response?.data || { message: err.message });
   }
 });
 

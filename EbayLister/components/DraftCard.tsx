@@ -1,5 +1,5 @@
 import { View, Text, Image, TextInput, TouchableOpacity, ActivityIndicator, StyleSheet, ScrollView, Platform } from 'react-native';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { EbayOffer, EnhancementResult } from '../services';
 import { DescTemplate, RateTable } from '../App';
 
@@ -111,6 +111,72 @@ const ReturnPolicyPicker = ({ value, onChange }: { value: string; onChange: (v: 
     );
   }
   return <EditField label="RETURN POLICY" value={value} onChangeText={onChange} />;
+};
+
+const CategoryPicker = ({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (id: string) => void;
+}) => {
+  const [query, setQuery] = useState('');
+  const [suggestions, setSuggestions] = useState<{ categoryId: string; categoryPath: string }[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (query.length < 2) { setSuggestions([]); return; }
+    const timer = setTimeout(async () => {
+      setLoading(true);
+      try {
+        const r = await fetch(`${BACKEND_URL}/api/category-suggestions?q=${encodeURIComponent(query)}`);
+        const data = await r.json();
+        setSuggestions(data.suggestions || []);
+      } catch { setSuggestions([]); }
+      finally { setLoading(false); }
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  return (
+    <View style={styles.field}>
+      <Text style={styles.fieldLabel}>CATEGORY ID (required to publish)</Text>
+      {value ? (
+        <View style={styles.categorySelected}>
+          <Text style={styles.categorySelectedText}>ID: {value}</Text>
+          <TouchableOpacity onPress={() => onChange('')} style={styles.categoryClrBtn}>
+            <Text style={styles.categoryClrBtnText}>✕</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+      <TextInput
+        style={styles.input}
+        value={query}
+        onChangeText={setQuery}
+        placeholder={value ? 'Search to change category...' : 'Search category (e.g. "brake caliper")'}
+        placeholderTextColor="#aaa"
+      />
+      {loading && <Text style={styles.categoryLoading}>Searching...</Text>}
+      {suggestions.length > 0 && (
+        <View style={styles.categorySuggestions}>
+          {suggestions.map(s => (
+            <TouchableOpacity
+              key={s.categoryId}
+              style={styles.categorySuggRow}
+              onPress={() => {
+                onChange(s.categoryId);
+                setQuery('');
+                setSuggestions([]);
+              }}
+            >
+              <Text style={styles.categorySuggPath}>{s.categoryPath}</Text>
+              <Text style={styles.categorySuggId}>#{s.categoryId}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+    </View>
+  );
 };
 
 const EditMultiField = ({
@@ -226,21 +292,57 @@ const defaultScheduleDate = (allScheduledDates: string[]): string => {
   return `${base.getFullYear()}-${pad(base.getMonth() + 1)}-${pad(base.getDate())}T06:00`;
 };
 
-// Approximate 2026 USPS Priority Mail commercial base rates
-const USPS_RATE_TABLE = [
-  { max: 1,  label: '≤1 lb',   rate: 9.25 },
-  { max: 2,  label: '≤2 lbs',  rate: 10.20 },
-  { max: 3,  label: '≤3 lbs',  rate: 11.10 },
-  { max: 5,  label: '≤5 lbs',  rate: 12.50 },
-  { max: 10, label: '≤10 lbs', rate: 15.30 },
-  { max: 15, label: '≤15 lbs', rate: 19.10 },
-  { max: 20, label: '≤20 lbs', rate: 22.75 },
-  { max: 25, label: '≤25 lbs', rate: 26.50 },
-  { max: 70, label: '≤70 lbs', rate: 54.20 },
+// Approximate commercial base rates — Zone 4-5 midpoint; ±15% range covers most zones
+const USPS_PRIORITY_RATES = [
+  { max: 1,  rate: 9.25 },
+  { max: 2,  rate: 10.20 },
+  { max: 3,  rate: 11.10 },
+  { max: 5,  rate: 12.50 },
+  { max: 10, rate: 15.30 },
+  { max: 15, rate: 19.10 },
+  { max: 20, rate: 22.75 },
+  { max: 25, rate: 26.50 },
+  { max: 70, rate: 54.20 },
+];
+
+const USPS_GROUND_RATES = [
+  { max: 1,  rate: 5.60 },
+  { max: 2,  rate: 7.10 },
+  { max: 3,  rate: 8.40 },
+  { max: 5,  rate: 10.20 },
+  { max: 10, rate: 13.80 },
+  { max: 15, rate: 17.50 },
+  { max: 20, rate: 21.00 },
+  { max: 25, rate: 25.00 },
+  { max: 70, rate: 38.00 },
+];
+
+const UPS_GROUND_RATES = [
+  { max: 1,  rate: 9.25 },
+  { max: 2,  rate: 10.75 },
+  { max: 3,  rate: 11.75 },
+  { max: 5,  rate: 13.50 },
+  { max: 10, rate: 18.25 },
+  { max: 15, rate: 22.75 },
+  { max: 20, rate: 27.00 },
+  { max: 25, rate: 31.00 },
+  { max: 70, rate: 52.00 },
+];
+
+const FEDEX_GROUND_RATES = [
+  { max: 1,  rate: 9.50 },
+  { max: 2,  rate: 11.00 },
+  { max: 3,  rate: 12.00 },
+  { max: 5,  rate: 14.25 },
+  { max: 10, rate: 18.50 },
+  { max: 15, rate: 23.00 },
+  { max: 20, rate: 27.50 },
+  { max: 25, rate: 31.50 },
+  { max: 70, rate: 53.00 },
 ];
 
 // Returns billable weight using dimensional weight formula (L×W×H / 139)
-const getUspsBillableWeight = (weight: string, length: string, width: string, height: string): number => {
+const getBillableWeight = (weight: string, length: string, width: string, height: string): number => {
   const w = parseFloat(weight);
   if (!w || isNaN(w)) return 0;
   const l = parseFloat(length);
@@ -250,42 +352,10 @@ const getUspsBillableWeight = (weight: string, length: string, width: string, he
   return Math.max(w, dimWeight);
 };
 
-const estimateUspsRange = (weight: string, length: string, width: string, height: string): string => {
-  const billable = getUspsBillableWeight(weight, length, width, height);
-  if (billable <= 0) return '';
-  const entry = USPS_RATE_TABLE.find(r => billable <= r.max);
+const rateEstimate = (table: { max: number; rate: number }[], billable: number): string => {
+  const entry = table.find(r => billable <= r.max);
   if (!entry) return '';
   return `~$${(entry.rate * 0.85).toFixed(2)}–$${(entry.rate * 1.15).toFixed(2)}`;
-};
-
-// Dropdown for selecting a USPS Priority rate tier; highlights suggested tier based on billable weight
-const ShippingRatePicker = ({
-  value, onChange, billableWeight,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  billableWeight: number;
-}) => {
-  const suggestedRate = billableWeight > 0 ? USPS_RATE_TABLE.find(r => billableWeight <= r.max) : null;
-  if (Platform.OS !== 'web') return null;
-  return (
-    <View style={styles.field}>
-      <Text style={styles.fieldLabel}>USPS PRIORITY RATE TABLE</Text>
-      {/* @ts-ignore — native <select> on web */}
-      <select
-        value={USPS_RATE_TABLE.find(r => r.rate.toFixed(2) === value)?.rate.toFixed(2) ?? ''}
-        onChange={(e: any) => { if (e.target.value) onChange(e.target.value); }}
-        style={webSelectStyle}
-      >
-        <option value="">— select tier —</option>
-        {USPS_RATE_TABLE.map(tier => (
-          <option key={tier.max} value={tier.rate.toFixed(2)}>
-            {tier.label}  —  ${tier.rate.toFixed(2)}{suggestedRate?.max === tier.max ? '  ✓ suggested' : ''}
-          </option>
-        ))}
-      </select>
-    </View>
-  );
 };
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -319,8 +389,10 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
     packageHeight: draft.packageHeight != null ? String(draft.packageHeight) : '',
     shippingCost:  draft.shippingCost  || '',
     rateTableId:   draft.rateTableId   || '',
+    categoryId:    draft.categoryId    || '',
   });
 
+  const [descHeight, setDescHeight] = useState(56);
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -366,7 +438,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
       const res = await fetch(`${BACKEND_URL}/api/publish-listing`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sku: draft.sku }),
+        body: JSON.stringify({ sku: draft.sku, categoryId: editData.categoryId || undefined }),
       });
       const data = await res.json();
       if (data.success) {
@@ -425,6 +497,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
           height: editData.packageHeight || undefined,
           shippingCost: editData.shippingCost || undefined,
           rateTableId: editData.rateTableId || undefined,
+          categoryId: editData.categoryId || undefined,
         }),
       });
       const data = await res.json();
@@ -473,8 +546,13 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
   };
 
   const aspectEntries = Object.entries(editData.aspects);
-  const billableWeight = getUspsBillableWeight(editData.packageWeight, editData.packageLength, editData.packageWidth, editData.packageHeight);
-  const uspsEstimate = estimateUspsRange(editData.packageWeight, editData.packageLength, editData.packageWidth, editData.packageHeight);
+  const billableWeight = getBillableWeight(editData.packageWeight, editData.packageLength, editData.packageWidth, editData.packageHeight);
+  const shippingEstimates = billableWeight > 0 ? [
+    { label: 'USPS Priority',       range: rateEstimate(USPS_PRIORITY_RATES, billableWeight) },
+    { label: 'USPS Ground Adv.',    range: rateEstimate(USPS_GROUND_RATES,    billableWeight) },
+    { label: 'UPS Ground',          range: rateEstimate(UPS_GROUND_RATES,     billableWeight) },
+    { label: 'FedEx Ground',        range: rateEstimate(FEDEX_GROUND_RATES,   billableWeight) },
+  ].filter(e => e.range) : [];
 
   return (
     <View style={styles.card}>
@@ -572,13 +650,17 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
                 />
               </View>
             </View>
-            {!!uspsEstimate && (
-              <Text style={styles.shippingEstimate}>USPS Priority: {uspsEstimate}</Text>
+            {shippingEstimates.length > 0 && (
+              <View style={styles.shippingEstimates}>
+                {shippingEstimates.map(e => (
+                  <Text key={e.label} style={styles.shippingEstimate}>{e.label}: {e.range}</Text>
+                ))}
+              </View>
             )}
             {/* eBay rate table selector — uses tables configured in Seller Hub */}
             {rateTables.length > 0 && Platform.OS === 'web' && (
               <View style={styles.field}>
-                <Text style={styles.fieldLabel}>EBAY RATE TABLE (regional pricing)</Text>
+                <Text style={styles.fieldLabel}>EBAY RATE TABLE (AK/HI &amp; international overrides)</Text>
                 {/* @ts-ignore — native <select> on web */}
                 <select
                   value={editData.rateTableId}
@@ -594,13 +676,8 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
                 </select>
               </View>
             )}
-            <ShippingRatePicker
-              value={editData.shippingCost}
-              onChange={setField('shippingCost')}
-              billableWeight={billableWeight}
-            />
-            <View style={[styles.field, !!editData.rateTableId && styles.fieldDimmed]}>
-              <Text style={styles.fieldLabel}>FLAT RATE SHIPPING (USD){editData.rateTableId ? ' — overridden by rate table' : ''}</Text>
+            <View style={styles.field}>
+              <Text style={styles.fieldLabel}>FLAT RATE SHIPPING (USD) — lower 48 states</Text>
               <TextInput
                 style={styles.input}
                 value={editData.shippingCost}
@@ -611,6 +688,8 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
               />
             </View>
           </View>
+
+          <CategoryPicker value={editData.categoryId} onChange={setField('categoryId')} />
 
           {/* Description with template dropdown */}
           <View style={styles.field}>
@@ -639,11 +718,11 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
               </select>
             )}
             <TextInput
-              style={[styles.input, styles.inputMultiline]}
+              style={[styles.input, styles.inputMultiline, { height: Math.max(56, descHeight) }]}
               value={editData.description}
               onChangeText={setField('description')}
+              onContentSizeChange={e => setDescHeight(e.nativeEvent.contentSize.height)}
               multiline
-              numberOfLines={3}
             />
           </View>
 
@@ -1045,6 +1124,48 @@ const styles = StyleSheet.create({
   shippingBlock: { gap: 6, marginTop: 4, padding: 8, backgroundColor: '#f8f8f8', borderRadius: 6, borderWidth: 1, borderColor: '#e0e0e0' },
   dimRow: { flexDirection: 'row', gap: 6 },
   dimField: { flex: 1 },
+  shippingEstimates: { gap: 2 },
   shippingEstimate: { fontSize: 12, color: '#388e3c', fontWeight: '600', fontStyle: 'italic' },
   fieldDimmed: { opacity: 0.45 },
+  categorySelected: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#e8f5e9',
+    borderRadius: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginBottom: 4,
+    alignSelf: 'flex-start',
+  },
+  categorySelectedText: { fontSize: 12, color: '#2e7d32', fontWeight: '600' },
+  categoryClrBtn: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#c8e6c9',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  categoryClrBtnText: { fontSize: 10, color: '#1b5e20', fontWeight: '700' },
+  categoryLoading: { fontSize: 11, color: '#999', fontStyle: 'italic', marginTop: 2 },
+  categorySuggestions: {
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+    borderRadius: 4,
+    backgroundColor: '#fff',
+    marginTop: 2,
+    overflow: 'hidden',
+  },
+  categorySuggRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  categorySuggPath: { fontSize: 12, color: '#222', flex: 1, flexWrap: 'wrap' },
+  categorySuggId: { fontSize: 11, color: '#888', marginLeft: 6, flexShrink: 0 },
 });
