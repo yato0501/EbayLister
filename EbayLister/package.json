@@ -8,7 +8,8 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "server": "node server/index.js",
-    "deploy:lambda": "bash ../aws-infrastructure/deploy-lambda.sh"
+    "deploy:lambda": "bash ../aws-infrastructure/deploy-lambda.sh",
+    "deploy:web": "bash ../aws-infrastructure/deploy-web.sh"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "^2.2.0",

@@ -29,6 +29,12 @@ data "aws_iam_policy_document" "lambda_permissions" {
     ]
     resources = [aws_dynamodb_table.tokens.arn]
   }
+
+  statement {
+    sid     = "S3Images"
+    actions = ["s3:PutObject", "s3:DeleteObject", "s3:GetObject"]
+    resources = ["${aws_s3_bucket.images.arn}/*"]
+  }
 }
 
 resource "aws_iam_role_policy" "lambda_permissions" {

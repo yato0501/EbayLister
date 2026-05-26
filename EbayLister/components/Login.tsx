@@ -6,7 +6,7 @@ interface LoginProps {
   onLoginSuccess: () => void;
 }
 
-const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://api.ebay.who-is-tou.com';
 
 export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   const [loading, setLoading] = useState(false);
@@ -105,7 +105,10 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
     setError(null);
 
     try {
-      const authUrl = `${BACKEND_URL}/auth/ebay`;
+      // Pass our own origin so the callback knows where to redirect back to.
+      // Works automatically for both localhost (dev) and the live domain (prod).
+      const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8081';
+      const authUrl = `${BACKEND_URL}/auth/ebay?app_url=${encodeURIComponent(origin)}`;
 
       // On web, navigate in the same tab so the OAuth callback returns here
       if (typeof window !== 'undefined') {

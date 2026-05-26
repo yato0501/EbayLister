@@ -5,7 +5,7 @@ import { useListingDrafts } from './hooks/useListingDrafts';
 import { Header, ErrorMessage, LoadingIndicator, DraftList, Login, NewDraftForm } from './components';
 import { AuthService } from './services';
 
-const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://api.ebay.who-is-tou.com';
 
 export type DescTemplate = { name: string; text: string };
 export type RateTable = { rateTableId: string; name: string; type: string };

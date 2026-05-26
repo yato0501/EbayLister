@@ -1,9 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 // Load .env.development for local dev; ignored in Lambda (env vars set by Terraform)
 try { require('dotenv').config({ path: '.env.development' }); } catch (e) {}
+
+const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+const IMAGE_BUCKET = process.env.IMAGE_BUCKET;
 
 const app = express();
 app.use(cors());
@@ -41,7 +46,7 @@ const APP_URL = process.env.APP_URL || 'http://localhost:8081';
 
 const DYNAMODB_TABLE = process.env.DYNAMODB_TABLE_NAME;
 
-let memoryStore = { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {} };
+let memoryStore = { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {}, skuPrices: {} };
 let dynamoCache = null;
 
 async function loadTokens() {
@@ -65,7 +70,8 @@ async function loadTokens() {
     skuShippingCosts:        result.Item.skuShippingCosts        ? JSON.parse(result.Item.skuShippingCosts.S)        : {},
     skuRateTables:           result.Item.skuRateTables           ? JSON.parse(result.Item.skuRateTables.S)           : {},
     skuCategoryIds:          result.Item.skuCategoryIds          ? JSON.parse(result.Item.skuCategoryIds.S)          : {},
-  } : { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {}, skuCategoryIds: {} };
+    skuPrices:               result.Item.skuPrices               ? JSON.parse(result.Item.skuPrices.S)               : {},
+  } : { user: null, app: null, skus: [], skuSchedules: {}, descTemplates: [], skuFulfillmentPolicies: {}, skuShippingCosts: {}, skuRateTables: {}, skuCategoryIds: {}, skuPrices: {} };
 
   return dynamoCache;
 }
@@ -90,6 +96,7 @@ async function saveTokens(tokens) {
       skuShippingCosts:       { S: JSON.stringify(tokens.skuShippingCosts || {}) },
       skuRateTables:          { S: JSON.stringify(tokens.skuRateTables || {}) },
       skuCategoryIds:         { S: JSON.stringify(tokens.skuCategoryIds || {}) },
+      skuPrices:              { S: JSON.stringify(tokens.skuPrices || {}) },
       updatedAt:    { S: new Date().toISOString() },
     },
   }));
@@ -246,11 +253,17 @@ app.get('/auth/ebay', (req, res) => {
     ? 'https://auth.sandbox.ebay.com/oauth2/authorize'
     : 'https://auth.ebay.com/oauth2/authorize';
 
+  // Accept the frontend's own origin so the callback can redirect back there.
+  // Falls back to APP_URL env var (used for non-browser / native clients).
+  const appUrl = req.query.app_url || APP_URL;
+  const state = Buffer.from(JSON.stringify({ app_url: appUrl })).toString('base64');
+
   const params = new URLSearchParams({
     client_id: EBAY_CLIENT_ID,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
     scope: SCOPES,
+    state,
   });
 
   console.log('🔐 Redirecting to eBay authorization...');
@@ -258,7 +271,16 @@ app.get('/auth/ebay', (req, res) => {
 });
 
 app.get('/auth/ebay/callback', async (req, res) => {
-  const { code, error } = req.query;
+  const { code, error, state } = req.query;
+
+  // Recover the app_url the frontend passed through state
+  let appUrl = APP_URL;
+  if (state) {
+    try {
+      const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+      if (stateData.app_url) appUrl = stateData.app_url;
+    } catch {}
+  }
 
   if (error || !code) {
     return res.send(`<html><body style="font-family:Arial;padding:40px;text-align:center">
@@ -299,7 +321,7 @@ app.get('/auth/ebay/callback', async (req, res) => {
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'AUTH_SUCCESS', tokens }));
         }
         setTimeout(() => {
-          window.location.href = '${APP_URL}/#auth-success?' + encodeURIComponent(JSON.stringify(tokens));
+          window.location.href = '${appUrl}/#auth-success?' + encodeURIComponent(JSON.stringify(tokens));
         }, 1000);
       </script></body></html>`);
   } catch (err) {
@@ -362,6 +384,7 @@ app.get('/api/listings', async (req, res) => {
     const skuShippingCosts = stored.skuShippingCosts || {};
     const skuRateTables = stored.skuRateTables || {};
     const skuCategoryIds = stored.skuCategoryIds || {};
+    const skuPrices = stored.skuPrices || {};
     const token = await getUserAccessToken();
     const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
 
@@ -407,6 +430,7 @@ app.get('/api/listings', async (req, res) => {
       shippingCost: skuShippingCosts[l.sku] || null,
       rateTableId: skuRateTables[l.sku] || null,
       categoryId: skuCategoryIds[l.sku] || null,
+      price: skuPrices[l.sku] || null,
       offers: l.offers.map(o => ({
         ...o,
         returnPolicy: o.listingPolicies?.returnPolicyId ? (policyMap[o.listingPolicies.returnPolicyId] || null) : null,
@@ -696,9 +720,21 @@ app.post('/api/listings', async (req, res) => {
   }
 });
 
+app.post('/api/upload-url', async (req, res) => {
+  if (!IMAGE_BUCKET) return res.status(500).json({ error: 'IMAGE_BUCKET not configured' });
+  const { contentType, sku } = req.body;
+  if (!contentType) return res.status(400).json({ error: 'contentType required' });
+  const ext = (contentType.split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+  const key = `images/${sku || 'misc'}/${Date.now()}.${ext}`;
+  const cmd = new PutObjectCommand({ Bucket: IMAGE_BUCKET, Key: key, ContentType: contentType });
+  const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 300 });
+  const imageUrl = `https://${IMAGE_BUCKET}.s3.amazonaws.com/${key}`;
+  res.json({ uploadUrl, imageUrl });
+});
+
 app.put('/api/listings/:sku', async (req, res) => {
   const { sku } = req.params;
-  const { title, condition, conditionDescription, description, quantity, aspects, returnPolicyChoice, scheduledDate, weight, length, width, height, shippingCost, rateTableId, categoryId, price } = req.body;
+  const { title, condition, conditionDescription, description, quantity, aspects, returnPolicyChoice, scheduledDate, weight, length, width, height, shippingCost, rateTableId, categoryId, price, imageUrls } = req.body;
 
   try {
     // Persist categoryId to DynamoDB immediately — before any eBay API calls that could fail
@@ -724,6 +760,7 @@ app.put('/api/listings/:sku', async (req, res) => {
         title:       title       ?? current.product?.title,
         description: description ?? current.product?.description,
         aspects:     aspects     ?? current.product?.aspects,
+        ...(imageUrls ? { imageUrls } : {}),
       },
       availability: {
         ...current.availability,
@@ -836,6 +873,15 @@ app.put('/api/listings/:sku', async (req, res) => {
       await setSkuSchedule(sku, scheduledDate);
     } else if (scheduledDate === null || scheduledDate === '') {
       await clearSkuSchedule(sku);
+    }
+
+    // Persist price to DynamoDB so it survives offer-update failures and Motors SKUs
+    console.log(`[price save] sku=${sku} price=${JSON.stringify(price)}`);
+    if (price != null && price !== '') {
+      const sp = await loadTokens();
+      const skuPrices = { ...(sp.skuPrices || {}), [sku]: price };
+      console.log(`[price save] writing skuPrices:`, JSON.stringify(skuPrices));
+      await saveTokens({ ...sp, skuPrices });
     }
 
     res.json({ success: true });
@@ -1183,6 +1229,7 @@ app.post('/api/publish-listing', async (req, res) => {
     dynamoCache = null;
     const storedData = await loadTokens();
     const storedCategoryId = (storedData.skuCategoryIds || {})[sku];
+    const storedPrice = (storedData.skuPrices || {})[sku] || price;
 
     const useMotors = storedCategoryId
       ? true
@@ -1227,6 +1274,7 @@ app.post('/api/publish-listing', async (req, res) => {
         listingPolicies,
         merchantLocationKey: merchantLocationKey || offerBody.merchantLocationKey,
         ...(categoryId ? { categoryId } : {}),
+        ...(storedPrice ? { pricingSummary: { price: { value: storedPrice, currency: 'USD' } } } : {}),
       });
       // If the offer's marketplace doesn't match what we need, OR it's in a broken state,
       // delete and recreate so we have a clean UNPUBLISHED offer to publish
@@ -1422,6 +1470,7 @@ app.get('/api/debug/stored', async (req, res) => {
       skuCategoryIds: stored.skuCategoryIds || {},
       skuShippingCosts: stored.skuShippingCosts || {},
       skuRateTables: stored.skuRateTables || {},
+      skuPrices: stored.skuPrices || {},
       skus: stored.skus || [],
     });
   } catch (err) {

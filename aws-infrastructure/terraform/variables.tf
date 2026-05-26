@@ -68,3 +68,9 @@ variable "ebay_ru_name" {
   type        = string
   default     = ""
 }
+
+variable "frontend_domain" {
+  description = "Custom domain for the frontend app (e.g. app.who-is-tou.com)"
+  type        = string
+  default     = ""
+}

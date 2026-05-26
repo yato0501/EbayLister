@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react';
 import { EbayOffer, EnhancementResult } from '../services';
 import { DescTemplate, RateTable } from '../App';
 
-const BACKEND_URL = 'https://api.ebay.who-is-tou.com';
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://api.ebay.who-is-tou.com';
 
 // Generate 3 search-friendly variants of a part number.
 // e.g. "89541-04010" → ["89541-04010 89541 04010 8954104010"] if ≤65 chars,
@@ -374,6 +374,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
   const [editData, setEditData] = useState({
     title:                draft.title                || '',
     price:                draft.pricingSummary?.price?.value || '',
+    imageUrls:            draft.imageUrls ? [...draft.imageUrls] : [] as string[],
     condition:            draft.condition            || 'USED_GOOD',
     conditionDescription: draft.conditionDescription || '',
     returnPolicyChoice:   initialReturnPolicyChoice,
@@ -393,6 +394,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
     categoryId:    draft.categoryId    || '',
   });
 
+  const [uploading, setUploading] = useState(false);
   const [descHeight, setDescHeight] = useState(56);
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
@@ -405,6 +407,27 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
 
   const setAspectValues = (key: string) => (vals: string[]) =>
     setEditData(prev => ({ ...prev, aspects: { ...prev.aspects, [key]: vals } }));
+
+  const handlePhotoUpload = async (file: File) => {
+    setUploading(true);
+    try {
+      const urlRes = await fetch(`${BACKEND_URL}/api/upload-url`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contentType: file.type, sku: draft.sku }),
+      });
+      const { uploadUrl, imageUrl } = await urlRes.json();
+      await fetch(uploadUrl, { method: 'PUT', body: file, headers: { 'Content-Type': file.type } });
+      setEditData(prev => ({ ...prev, imageUrls: [...prev.imageUrls, imageUrl] }));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const removeImage = (i: number) =>
+    setEditData(prev => ({ ...prev, imageUrls: prev.imageUrls.filter((_, j) => j !== i) }));
 
   // Build Manufacturer Part Number aspect values: MPN + interchangeable part numbers, each with 3 variants
   const buildMpnAspect = (e: EnhancementResult): string[] => [
@@ -504,6 +527,7 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
           rateTableId: editData.rateTableId || undefined,
           categoryId: editData.categoryId || undefined,
           price: editData.price || undefined,
+          imageUrls: editData.imageUrls.length > 0 ? editData.imageUrls : undefined,
         }),
       });
       const data = await res.json();
@@ -562,14 +586,39 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
 
   return (
     <View style={styles.card}>
-      {/* Images */}
-      {draft.imageUrls && draft.imageUrls.length > 0 && (
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.imageRow}>
-          {draft.imageUrls.map((url, i) => (
-            <Image key={i} source={{ uri: url }} style={styles.image} resizeMode="cover" />
-          ))}
-        </ScrollView>
-      )}
+      {/* Photos — editable */}
+      <View style={styles.photoSection}>
+        {editData.imageUrls.length > 0 && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.imageRow}>
+            {editData.imageUrls.map((url, i) => (
+              <View key={i} style={styles.imageWrap}>
+                <Image source={{ uri: url }} style={styles.image} resizeMode="cover" />
+                <TouchableOpacity style={styles.removeImageBtn} onPress={() => removeImage(i)}>
+                  <Text style={styles.removeImageBtnText}>✕</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+          </ScrollView>
+        )}
+        {Platform.OS === 'web' && (
+          <View style={styles.photoButtons}>
+            {/* @ts-ignore — HTML label/input on web */}
+            <label style={uploading ? { ...photoInputLabelStyle, opacity: 0.5 } : photoInputLabelStyle}>
+              {uploading ? 'Uploading...' : '📷 Take Photo'}
+              <input type="file" accept="image/*" capture="environment" style={{ display: 'none' }}
+                onChange={(e: any) => { const f = e.target.files?.[0]; if (f) handlePhotoUpload(f); e.target.value = ''; }}
+              />
+            </label>
+            {/* @ts-ignore */}
+            <label style={uploading ? { ...photoInputLabelStyle, opacity: 0.5 } : photoInputLabelStyle}>
+              🖼 Library
+              <input type="file" accept="image/*" style={{ display: 'none' }}
+                onChange={(e: any) => { const f = e.target.files?.[0]; if (f) handlePhotoUpload(f); e.target.value = ''; }}
+              />
+            </label>
+          </View>
+        )}
+      </View>
 
       {/* Title row with delete button */}
       <View style={styles.titleRow}>
@@ -922,6 +971,22 @@ export const DraftCard = ({ draft, index, onDelete, allScheduledDates = [], desc
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
+const photoInputLabelStyle: React.CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 4,
+  backgroundColor: '#1976d2',
+  color: '#fff',
+  borderRadius: 6,
+  paddingTop: 6,
+  paddingBottom: 6,
+  paddingLeft: 12,
+  paddingRight: 12,
+  fontSize: 12,
+  fontWeight: '600',
+  cursor: 'pointer',
+};
+
 const webSelectStyle = {
   fontSize: 13,
   color: '#222',
@@ -955,8 +1020,18 @@ const styles = StyleSheet.create({
     elevation: 3,
     overflow: 'hidden',
   },
-  imageRow: { flexDirection: 'row' },
-  image: { width: 120, height: 120, marginRight: 4 },
+  photoSection: { backgroundColor: '#f5f5f5', borderBottomWidth: 1, borderBottomColor: '#e0e0e0' },
+  imageRow: { flexDirection: 'row', padding: 8 },
+  imageWrap: { position: 'relative', marginRight: 6 },
+  image: { width: 110, height: 110, borderRadius: 4 },
+  removeImageBtn: {
+    position: 'absolute', top: 2, right: 2,
+    width: 20, height: 20, borderRadius: 10,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  removeImageBtnText: { color: '#fff', fontSize: 10, fontWeight: '700', lineHeight: 12 },
+  photoButtons: { flexDirection: 'row', gap: 8, padding: 8, paddingTop: 0 },
   titleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 15, paddingTop: 12, paddingBottom: 8 },
   deleteBtn: {
     backgroundColor: '#d32f2f',

@@ -31,6 +31,7 @@ resource "aws_lambda_function" "backend" {
       EBAY_PRODUCTION_CLIENT_ID     = var.ebay_production_client_id
       EBAY_PRODUCTION_CLIENT_SECRET = var.ebay_production_client_secret
       ANTHROPIC_API_KEY             = var.anthropic_api_key
+      IMAGE_BUCKET                  = aws_s3_bucket.images.bucket
     }
   }
 

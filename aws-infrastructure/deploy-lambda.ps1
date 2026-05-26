@@ -44,8 +44,10 @@ $serverPackageJson = @{
         "dotenv"              = "^17.2.3"
         "axios"               = "^1.13.2"
         "serverless-http"     = "^3.2.0"
-        "@aws-sdk/client-dynamodb" = "^3.0.0"
-        "@anthropic-ai/sdk"        = "^0.98.0"
+        "@aws-sdk/client-dynamodb"      = "^3.0.0"
+        "@aws-sdk/client-s3"            = "^3.0.0"
+        "@aws-sdk/s3-request-presigner" = "^3.0.0"
+        "@anthropic-ai/sdk"             = "^0.98.0"
     }
 } | ConvertTo-Json -Depth 3
 

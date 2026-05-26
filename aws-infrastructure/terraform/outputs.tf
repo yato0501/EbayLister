@@ -38,3 +38,34 @@ output "api_gateway_domain_target" {
   description = "Point api.ebay.who-is-tou.com CNAME to this value (after cert validation)"
   value       = aws_apigatewayv2_domain_name.backend.domain_name_configuration[0].target_domain_name
 }
+
+output "image_bucket_url" {
+  description = "Public base URL for uploaded listing images"
+  value       = "https://${aws_s3_bucket.images.bucket}.s3.amazonaws.com"
+}
+
+output "frontend_bucket" {
+  description = "S3 bucket name for the Expo web build"
+  value       = local.deploy_frontend ? aws_s3_bucket.frontend[0].id : ""
+}
+
+output "frontend_distribution_id" {
+  description = "CloudFront distribution ID — used by deploy-web script for cache invalidation"
+  value       = local.deploy_frontend ? aws_cloudfront_distribution.frontend[0].id : ""
+}
+
+output "frontend_cloudfront_domain" {
+  description = "Point app.ebaylister.who-is-tou.com CNAME to this value"
+  value       = local.deploy_frontend ? aws_cloudfront_distribution.frontend[0].domain_name : ""
+}
+
+output "frontend_acm_validation_records" {
+  description = "DNS CNAME records needed to validate the frontend ACM certificate"
+  value = local.deploy_frontend ? {
+    for dvo in aws_acm_certificate.frontend[0].domain_validation_options : dvo.domain_name => {
+      name  = dvo.resource_record_name
+      type  = dvo.resource_record_type
+      value = dvo.resource_record_value
+    }
+  } : {}
+}
