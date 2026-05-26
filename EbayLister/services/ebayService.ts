@@ -240,7 +240,9 @@ class EbayService {
       const response = await axios.get(`${baseURL}/api/listings?_=${Date.now()}`);
       const { listings } = response.data;
 
-      return listings.map(({ sku, item, offers, scheduledDate, shippingCost, rateTableId, categoryId: storedCategoryId, price: storedPrice }: { sku: string; item: EbayInventoryItem | null; offers: EbayOffer[]; scheduledDate?: string | null; shippingCost?: string | null; rateTableId?: string | null; categoryId?: string | null; price?: string | null }) => {
+      return listings
+      .filter(({ offers }: { offers: EbayOffer[] }) => (offers[0] as any)?.status !== 'PUBLISHED')
+      .map(({ sku, item, offers, scheduledDate, shippingCost, rateTableId, categoryId: storedCategoryId, price: storedPrice }: { sku: string; item: EbayInventoryItem | null; offers: EbayOffer[]; scheduledDate?: string | null; shippingCost?: string | null; rateTableId?: string | null; categoryId?: string | null; price?: string | null }) => {
         const offer = offers[0] || {};
         return {
           offerId:              offer.offerId            || sku,

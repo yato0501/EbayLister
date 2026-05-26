@@ -208,7 +208,7 @@ async function getOrUpdateSkuFulfillmentPolicy(token, sku, shippingCost, rateTab
   // Flat rate = lower 48 base cost; rate table = regional overrides (AK/HI, international) — both coexist
   const shippingService = {
     shippingCarrierCode: 'USPS',
-    shippingServiceCode: 'USPSPriority',
+    shippingServiceCode: 'USPSGroundAdvantage',
     freeShipping: false,
     additionalShippingCost: { value: '0.00', currency: 'USD' },
     ...(shippingCost ? { shippingCost: { value: parseFloat(shippingCost).toFixed(2), currency: 'USD' } } : {}),
@@ -388,14 +388,14 @@ app.get('/api/listings', async (req, res) => {
     const token = await getUserAccessToken();
     const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
 
-    // Try to get SKUs from eBay's list endpoint; fall back to stored SKUs on sandbox 25001 bug
+    // Fetch all inventory items from eBay as the source of truth.
+    // Fall back to stored SKUs if the eBay list endpoint fails (e.g. sandbox 25001 bug).
     let skus = [];
     try {
       const inventoryRes = await axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item`, { headers });
       skus = (inventoryRes.data.inventoryItems || []).map(item => item.sku);
     } catch (err) {
       console.log('Inventory list endpoint failed (error', err.response?.data?.errors?.[0]?.errorId, '), falling back to stored SKUs');
-      const stored = await loadTokens();
       skus = stored.skus || [];
     }
 
@@ -525,7 +525,7 @@ const getOrCreateMotorsFulfillmentPolicy = async (token) => {
       costType: 'FLAT_RATE',
       shippingServices: [{
         shippingCarrierCode: 'USPS',
-        shippingServiceCode: 'USPSPriority',
+        shippingServiceCode: 'USPSGroundAdvantage',
         freeShipping: false,
         shippingCost: { value: '5.00', currency: 'USD' },
         additionalShippingCost: { value: '0.00', currency: 'USD' },
@@ -624,7 +624,7 @@ const getOrCreateFulfillmentPolicy = async (token) => {
       costType: 'FLAT_RATE',
       shippingServices: [{
         shippingCarrierCode: 'USPS',
-        shippingServiceCode: 'USPSPriority',
+        shippingServiceCode: 'USPSGroundAdvantage',
         freeShipping: false,
         shippingCost: { value: '5.00', currency: 'USD' },
         additionalShippingCost: { value: '0.00', currency: 'USD' },
@@ -703,12 +703,11 @@ app.post('/api/listings', async (req, res) => {
       availability: { shipToLocationAvailability: { quantity: parseInt(quantity) } },
     }, { headers });
 
-    // Create offer (categoryId can be added later before publishing)
+    // Create offer (listingDescription and categoryId can be added later before publishing)
     await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, {
       sku,
       marketplaceId: 'EBAY_US',
       format: 'FIXED_PRICE',
-      listingDescription: title,
       pricingSummary: { price: { value: price, currency: 'USD' } },
     }, { headers });
 
@@ -790,12 +789,13 @@ app.put('/api/listings/:sku', async (req, res) => {
       let fulfillmentPolicyId;
       const hasShipping = (shippingCost != null && shippingCost !== '') || (rateTableId != null && rateTableId !== '');
       if (hasShipping) {
-        // Create/update a per-SKU policy (rate table takes precedence over flat cost)
-        fulfillmentPolicyId = await getOrUpdateSkuFulfillmentPolicy(token, sku, shippingCost, rateTableId);
+        // Persist shipping settings to DynamoDB first — independent of policy creation
         const s2 = await loadTokens();
         const skuShippingCosts = { ...(s2.skuShippingCosts || {}), [sku]: shippingCost || '' };
         const skuRateTables = { ...(s2.skuRateTables || {}), [sku]: rateTableId || '' };
         await saveTokens({ ...s2, skuShippingCosts, skuRateTables });
+        // Create/update a per-SKU fulfillment policy (used for Sell Inventory API path)
+        fulfillmentPolicyId = await getOrUpdateSkuFulfillmentPolicy(token, sku, shippingCost, rateTableId);
       } else {
         // Use existing per-SKU policy if available, otherwise fall back to default
         const s = await loadTokens();
@@ -1106,7 +1106,7 @@ function escapeXml(s) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-async function publishViaTrading(sku, categoryId, token, priceOverride) {
+async function publishViaTrading(sku, categoryId, token, priceOverride, scheduledTime) {
   const invHeaders = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
   const [itemRes, offersRes, storedRes] = await Promise.allSettled([
     axios.get(`${EBAY_BASE_URL}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers: invHeaders }),
@@ -1119,11 +1119,15 @@ async function publishViaTrading(sku, categoryId, token, priceOverride) {
   const stored = storedRes.status === 'fulfilled' ? storedRes.value : {};
 
   const title       = escapeXml((item.product?.title || sku).substring(0, 80));
-  const description = item.product?.description || offer.listingDescription || item.product?.title || sku;
+  const rawDesc     = item.product?.description || offer.listingDescription || item.product?.title || sku;
+  // Convert plain-text newlines to HTML so eBay preserves spacing in the rendered description
+  const description = '<p>' + rawDesc.split(/\n\n+/).map(p => p.replace(/\n/g, '<br>')).join('</p><p>') + '</p>';
   const conditionId = CONDITION_TO_TRADING_ID[item.condition] || 3000;
   const price       = priceOverride || offer.pricingSummary?.price?.value || '0.00';
   const quantity    = item.availability?.shipToLocationAvailability?.quantity || 1;
   const images      = (item.product?.imageUrls || []).slice(0, 12);
+  const pkgWeight   = item.packageWeightAndSize?.weight;
+  const pkgDims     = item.packageWeightAndSize?.dimensions;
 
   // Fetch seller's business profiles — required when seller is opted into business policies
   const profiles = await getSellerTradingProfiles(token).catch(e => {
@@ -1140,6 +1144,9 @@ async function publishViaTrading(sku, categoryId, token, priceOverride) {
     .map(([name, values]) => `    <NameValueList><Name>${escapeXml(name)}</Name>${(Array.isArray(values) ? values : [values]).map(v => `<Value>${escapeXml(String(v))}</Value>`).join('')}</NameValueList>`)
     .join('\n');
 
+  const storedShippingCost = (stored?.skuShippingCosts || {})[sku];
+  const storedRateTableId  = (stored?.skuRateTables  || {})[sku];
+
   // Use SellerProfiles (business policies) if we have IDs, otherwise fall back to legacy fields
   const shippingXml = profiles.shippingId
     ? `<SellerProfiles>
@@ -1151,8 +1158,8 @@ async function publishViaTrading(sku, categoryId, token, priceOverride) {
     <ShippingType>Flat</ShippingType>
     <ShippingServiceOptions>
       <ShippingServicePriority>1</ShippingServicePriority>
-      <ShippingService>USPSPriority</ShippingService>
-      <ShippingServiceCost>${(stored?.skuShippingCosts || {})[sku] || '5.00'}</ShippingServiceCost>
+      <ShippingService>USPSGroundAdvantage</ShippingService>
+      <ShippingServiceCost>${storedShippingCost || '5.00'}</ShippingServiceCost>
     </ShippingServiceOptions>
   </ShippingDetails>
   <ReturnPolicy>
@@ -1176,7 +1183,14 @@ async function publishViaTrading(sku, categoryId, token, priceOverride) {
     <Country>US</Country>
     <Currency>USD</Currency>
     <Location>United States</Location>
+    <AutoPay>true</AutoPay>
     <DispatchTimeMax>3</DispatchTimeMax>
+    ${scheduledTime ? `<ScheduleTime>${scheduledTime}</ScheduleTime>` : ''}
+    ${(pkgWeight || pkgDims) ? `<ShippingPackageDetails>
+      <ShippingPackage>PackageThickEnvelope</ShippingPackage>
+      ${pkgWeight ? `<WeightMajor unit="lbs">${Math.floor(pkgWeight.value)}</WeightMajor><WeightMinor unit="oz">${Math.round((pkgWeight.value % 1) * 16)}</WeightMinor>` : ''}
+      ${pkgDims   ? `<PackageDepth unit="in">${pkgDims.length}</PackageDepth><PackageLength unit="in">${pkgDims.width}</PackageLength><PackageWidth unit="in">${pkgDims.height}</PackageWidth>` : ''}
+    </ShippingPackageDetails>` : ''}
     ${pictureXml ? `<PictureDetails>\n${pictureXml}\n    </PictureDetails>` : ''}
     ${itemSpecificsXml ? `<ItemSpecifics>\n${itemSpecificsXml}\n  </ItemSpecifics>` : ''}
     ${shippingXml}
@@ -1230,6 +1244,23 @@ app.post('/api/publish-listing', async (req, res) => {
     const storedData = await loadTokens();
     const storedCategoryId = (storedData.skuCategoryIds || {})[sku];
     const storedPrice = (storedData.skuPrices || {})[sku] || price;
+    const storedScheduledDate = (storedData.skuSchedules || {})[sku];
+    // Convert datetime-local string (e.g. "2026-05-26T06:00") to UTC ISO string for eBay,
+    // treating the entered time as Pacific (America/Los_Angeles) — handles PST/PDT automatically.
+    const scheduledTime = (() => {
+      if (!storedScheduledDate) return null;
+      // Probe the date to find the Pacific UTC offset (e.g. "GMT-7" for PDT, "GMT-8" for PST)
+      const probe = new Date(storedScheduledDate + 'Z');
+      const tzPart = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/Los_Angeles',
+        timeZoneName: 'shortOffset',
+      }).formatToParts(probe).find(p => p.type === 'timeZoneName')?.value || 'GMT-8';
+      const m = tzPart.match(/GMT([+-])(\d+)/);
+      const sign = m ? m[1] : '-';
+      const hrs  = m ? m[2].padStart(2, '0') : '08';
+      return new Date(`${storedScheduledDate}:00${sign}${hrs}:00`).toISOString();
+    })();
+    console.log(`Publish: sku=${sku} scheduledDate=${storedScheduledDate} scheduledTime=${scheduledTime}`);
 
     const useMotors = storedCategoryId
       ? true
@@ -1238,7 +1269,7 @@ app.post('/api/publish-listing', async (req, res) => {
 
     if (useMotors) {
       const effectiveCategoryId = categoryId || storedCategoryId;
-      const result = await publishViaTrading(sku, effectiveCategoryId, token, price);
+      const result = await publishViaTrading(sku, effectiveCategoryId, token, price, scheduledTime);
       return res.json({
         success: true,
         listings: [{ listingId: result.listingId }],
@@ -1254,8 +1285,11 @@ app.post('/api/publish-listing', async (req, res) => {
     const effectiveCategoryId = categoryId || offers[0]?.categoryId || storedCategoryId;
     console.log(`Publish (Sell Inventory): offerCategory=${offers[0]?.categoryId} effective=${effectiveCategoryId}`);
 
+    // Use per-SKU fulfillment policy (has correct shipping cost + rate table) if one was saved,
+    // otherwise fall back to the default shared policy.
+    const skuFulfillmentPolicyId = (storedData.skuFulfillmentPolicies || {})[sku];
     const [fulfillmentPolicyId, returnPolicyId, merchantLocationKey] = await Promise.all([
-      getOrCreateFulfillmentPolicy(token),
+      skuFulfillmentPolicyId ? Promise.resolve(skuFulfillmentPolicyId) : getOrCreateFulfillmentPolicy(token),
       getOrCreateReturnPolicy(token, 'BUYER_PAYS_30'),
       getOrCreateMerchantLocation(token),
     ]);
@@ -1275,6 +1309,7 @@ app.post('/api/publish-listing', async (req, res) => {
         merchantLocationKey: merchantLocationKey || offerBody.merchantLocationKey,
         ...(categoryId ? { categoryId } : {}),
         ...(storedPrice ? { pricingSummary: { price: { value: storedPrice, currency: 'USD' } } } : {}),
+        ...(scheduledTime ? { scheduledTime } : {}),
       });
       // If the offer's marketplace doesn't match what we need, OR it's in a broken state,
       // delete and recreate so we have a clean UNPUBLISHED offer to publish
@@ -1287,6 +1322,7 @@ app.post('/api/publish-listing', async (req, res) => {
         await axios.post(`${EBAY_BASE_URL}/sell/inventory/v1/offer`, newBody, { headers });
       } else {
         try {
+          console.log(`PUT offer ${offerId} cleanBody:`, JSON.stringify(cleanBody));
           await axios.put(`${EBAY_BASE_URL}/sell/inventory/v1/offer/${offerId}`, cleanBody, { headers });
         } catch (putErr) {
           const putErrId = putErr.response?.data?.errors?.[0]?.errorId;
@@ -1324,11 +1360,11 @@ app.post('/api/publish-listing', async (req, res) => {
     }).flat();
 
     if (successes.length > 0) {
-      res.json({ success: true, listings: successes, errors: failures });
+      res.json({ success: true, listings: successes, errors: failures, scheduledTime });
     } else if (failures.some(e => e.errorId === 25713) && effectiveCategoryId) {
       // Offer is unavailable for Sell Inventory publish — fall back to Trading API
       console.log(`Sell Inventory publish failed with 25713, falling back to Trading API for category ${effectiveCategoryId}`);
-      const tradingResult = await publishViaTrading(sku, effectiveCategoryId, token, price);
+      const tradingResult = await publishViaTrading(sku, effectiveCategoryId, token, price, scheduledTime);
       res.json({ success: true, listings: [{ listingId: tradingResult.listingId }], errors: tradingResult.warnings.map(w => ({ message: w })) });
     } else {
       res.status(400).json({ success: false, errors: failures });
@@ -1471,6 +1507,7 @@ app.get('/api/debug/stored', async (req, res) => {
       skuShippingCosts: stored.skuShippingCosts || {},
       skuRateTables: stored.skuRateTables || {},
       skuPrices: stored.skuPrices || {},
+      skuSchedules: stored.skuSchedules || {},
       skus: stored.skus || [],
     });
   } catch (err) {
