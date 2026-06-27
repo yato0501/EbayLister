@@ -41,6 +41,9 @@ const REDIRECT_URI = process.env.REDIRECT_URI
 // Where the Expo web app lives — used to redirect after OAuth
 const APP_URL = process.env.APP_URL || 'http://localhost:8081';
 
+// Seller's ship-from zip code — used in Trading API listings for delivery estimates
+const SHIP_FROM_ZIP = process.env.SHIP_FROM_ZIP || '10001';
+
 // ── Token storage ─────────────────────────────────────────────────────────────
 // Uses DynamoDB in Lambda (DYNAMODB_TABLE_NAME is set), in-memory locally.
 
@@ -1068,6 +1071,35 @@ app.delete('/api/description-templates/:name', async (req, res) => {
 
 const TRADING_API_URL = `${EBAY_BASE_URL}/ws/api.dll`;
 
+let sellerPostalCodeCached = null;
+async function getSellerPostalCode(token) {
+  if (sellerPostalCodeCached) return sellerPostalCodeCached;
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+<GetUserRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <ErrorLanguage>en_US</ErrorLanguage>
+  <WarningLevel>High</WarningLevel>
+</GetUserRequest>`;
+  try {
+    const res = await axios.post(TRADING_API_URL, xml, {
+      headers: {
+        'X-EBAY-API-IAF-TOKEN': token,
+        'X-EBAY-API-CALL-NAME': 'GetUser',
+        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1193',
+        'X-EBAY-API-APP-NAME': process.env.EBAY_PRODUCTION_CLIENT_ID,
+        'Content-Type': 'text/xml',
+      },
+    });
+    const zip = (res.data.match(/<PostalCode>(\d{5}(?:-\d{4})?)<\/PostalCode>/) || [])[1];
+    if (zip) sellerPostalCodeCached = zip;
+    console.log(`GetUser postal code: ${zip}`);
+    return zip || SHIP_FROM_ZIP;
+  } catch (e) {
+    console.warn('GetUser failed, using fallback zip:', e.message);
+    return SHIP_FROM_ZIP;
+  }
+}
+
 async function getSellerTradingProfiles(token) {
   const xml = `<?xml version="1.0" encoding="utf-8"?>
 <GetSellerProfilesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
@@ -1129,12 +1161,12 @@ async function publishViaTrading(sku, categoryId, token, priceOverride, schedule
   const pkgWeight   = item.packageWeightAndSize?.weight;
   const pkgDims     = item.packageWeightAndSize?.dimensions;
 
-  // Fetch seller's business profiles — required when seller is opted into business policies
-  const profiles = await getSellerTradingProfiles(token).catch(e => {
-    console.warn('GetSellerProfiles failed, will use legacy fields:', e.message);
-    return {};
-  });
-  console.log(`Trading profiles: shipping=${profiles.shippingId} return=${profiles.returnId} payment=${profiles.paymentId}`);
+  // Fetch seller info in parallel
+  const [profiles, shipFromZip] = await Promise.all([
+    getSellerTradingProfiles(token).catch(e => { console.warn('GetSellerProfiles failed:', e.message); return {}; }),
+    getSellerPostalCode(token),
+  ]);
+  console.log(`Trading profiles: shipping=${profiles.shippingId} return=${profiles.returnId} payment=${profiles.paymentId} zip=${shipFromZip}`);
 
   const pictureXml = images.map(u => `      <PictureURL>${escapeXml(u)}</PictureURL>`).join('\n');
 
@@ -1159,7 +1191,7 @@ async function publishViaTrading(sku, categoryId, token, priceOverride, schedule
     <ShippingServiceOptions>
       <ShippingServicePriority>1</ShippingServicePriority>
       <ShippingService>USPSGroundAdvantage</ShippingService>
-      <ShippingServiceCost>${storedShippingCost || '5.00'}</ShippingServiceCost>
+      <ShippingServiceCost currencyID="USD">${storedShippingCost || '5.00'}</ShippingServiceCost>
     </ShippingServiceOptions>
   </ShippingDetails>
   <ReturnPolicy>
@@ -1183,6 +1215,7 @@ async function publishViaTrading(sku, categoryId, token, priceOverride, schedule
     <Country>US</Country>
     <Currency>USD</Currency>
     <Location>United States</Location>
+    <PostalCode>${shipFromZip}</PostalCode>
     <AutoPay>true</AutoPay>
     <DispatchTimeMax>3</DispatchTimeMax>
     ${scheduledTime ? `<ScheduleTime>${scheduledTime}</ScheduleTime>` : ''}
@@ -1262,14 +1295,13 @@ app.post('/api/publish-listing', async (req, res) => {
     })();
     console.log(`Publish: sku=${sku} scheduledDate=${storedScheduledDate} scheduledTime=${scheduledTime}`);
 
-    const useMotors = storedCategoryId
-      ? true
-      : (categoryId ? await isMotoorsCategory(categoryId) : false);
-    console.log(`Publish: sku=${sku} storedCategory=${storedCategoryId} reqCategory=${categoryId} useMotors=${useMotors}`);
+    // Always check the actual category — don't assume stored categories are Motors.
+    const effectiveCategory = storedCategoryId || categoryId;
+    const useMotors = effectiveCategory ? await isMotoorsCategory(effectiveCategory) : false;
+    console.log(`Publish: sku=${sku} storedCategory=${storedCategoryId} reqCategory=${categoryId} effectiveCategory=${effectiveCategory} useMotors=${useMotors}`);
 
     if (useMotors) {
-      const effectiveCategoryId = categoryId || storedCategoryId;
-      const result = await publishViaTrading(sku, effectiveCategoryId, token, price, scheduledTime);
+      const result = await publishViaTrading(sku, effectiveCategory, token, price, scheduledTime);
       return res.json({
         success: true,
         listings: [{ listingId: result.listingId }],
